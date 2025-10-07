@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  flask-app:
+    image: jang99u/lostfound-flask:latest
+    container_name: flask-app
+    ports:
+      - "5001:5001"
+    networks:
+      - backend
+
+  spring-app:
+    image: jang99u/lostfound-spring:latest
+    container_name: spring-app
+    depends_on:
+      - flask-app
+    ports:
+      - "8080:8080"
+    networks:
+      - backend
+
+networks:
+  backend:
