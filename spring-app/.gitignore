@@ -36,4 +36,5 @@ out/
 ### VS Code ###
 .vscode/
 application.yml
+application-prod.yml
 lostfounddev-b2bd22dd8a4a.json
