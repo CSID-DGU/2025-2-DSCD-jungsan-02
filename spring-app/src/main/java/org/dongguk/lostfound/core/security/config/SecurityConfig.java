@@ -49,10 +49,6 @@ public class SecurityConfig {
         configuration.addAllowedOriginPattern("http://localhost:*");
         configuration.addAllowedOriginPattern("https://localhost:*");
         
-        // 프로덕션 환경 허용
-        configuration.addAllowedOriginPattern("https://lostfound-dscd.site");
-        configuration.addAllowedOriginPattern("https://*.vercel.app");
-        
         // 모든 HTTP 메서드 허용
         configuration.addAllowedMethod("*");
         
