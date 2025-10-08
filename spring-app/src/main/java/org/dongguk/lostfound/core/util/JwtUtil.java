@@ -53,13 +53,19 @@ public class JwtUtil implements InitializingBean {
         Claims claims = Jwts.claims();
         claims.put(AuthConstant.USER_ID_CLAIM_NAME, id);
 
-        return Jwts.builder()
+        String token = Jwts.builder()
                 .setHeaderParam(Header.JWT_TYPE, Header.JWT_TYPE)
                 .setClaims(claims)
                 .setIssuedAt(new Date(System.currentTimeMillis()))
                 .setExpiration(new Date(System.currentTimeMillis() + expirePeriod))
                 .signWith(key, SignatureAlgorithm.HS512)
                 .compact();
+        
+        log.info("🔍 Generated JWT token for user {}: {}", id, token);
+        log.info("🔍 Token length: {}", token.length());
+        log.info("🔍 Token contains dots: {}", token.contains("."));
+        
+        return token;
     }
 
     public Claims getTokenBody(final String token){

@@ -9,6 +9,6 @@ import java.lang.annotation.Target;
 
 @Target(ElementType.PARAMETER)
 @Retention(RetentionPolicy.RUNTIME)
-@AuthenticationPrincipal(expression="T(com.botaniq.core.util.JwtUtil).checkPrincipal(#this)")
+@AuthenticationPrincipal(expression="T(org.dongguk.lostfound.core.util.JwtUtil).checkPrincipal(#this)")
 public @interface UserId {
 }
