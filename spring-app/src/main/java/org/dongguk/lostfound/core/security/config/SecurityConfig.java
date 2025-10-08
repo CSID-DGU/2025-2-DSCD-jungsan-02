@@ -46,13 +46,12 @@ public class SecurityConfig {
         CorsConfiguration configuration = new CorsConfiguration();
         
         // 로컬 개발 환경 허용
-        configuration.addAllowedOrigin("http://localhost:3000");
-        configuration.addAllowedOrigin("http://localhost:5173");
-        configuration.addAllowedOrigin("http://localhost:5174");
-        configuration.addAllowedOrigin("http://localhost:5175");
+        configuration.addAllowedOriginPattern("http://localhost:*");
+        configuration.addAllowedOriginPattern("https://localhost:*");
         
-        // 프로덕션 환경 허용 (필요시)
-        configuration.addAllowedOrigin("https://lostfound-dscd.site");
+        // 프로덕션 환경 허용
+        configuration.addAllowedOriginPattern("https://lostfound-dscd.site");
+        configuration.addAllowedOriginPattern("https://*.vercel.app");
         
         // 모든 HTTP 메서드 허용
         configuration.addAllowedMethod("*");
