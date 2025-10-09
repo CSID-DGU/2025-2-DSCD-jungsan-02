@@ -1,6 +1,7 @@
 package org.dongguk.lostfound.controller;
 
 import lombok.RequiredArgsConstructor;
+import org.dongguk.lostfound.core.annotation.UserId;
 import org.dongguk.lostfound.domain.type.ItemCategory;
 import org.dongguk.lostfound.dto.request.CreateLostItemRequest;
 import org.dongguk.lostfound.dto.request.SearchLostItemRequest;
@@ -26,6 +27,7 @@ public class LostItemController {
      */
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<LostItemDto> createLostItem(
+            @UserId Long userId,
             @RequestParam String itemName,
             @RequestParam ItemCategory category,
             @RequestParam String description,
@@ -37,7 +39,7 @@ public class LostItemController {
                 itemName, category, description, foundDate, location, image
         );
         
-        LostItemDto result = lostItemService.createLostItem(request);
+        LostItemDto result = lostItemService.createLostItem(userId, request);
         return ResponseEntity.ok(result);
     }
 
@@ -120,9 +122,10 @@ public class LostItemController {
      */
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> deleteLostItem(
+            @UserId Long userId,
             @PathVariable Long id
     ) {
-        lostItemService.deleteLostItem(id);
+        lostItemService.deleteLostItem(userId, id);
         return ResponseEntity.ok().build();
     }
 }

@@ -16,6 +16,8 @@ import org.dongguk.lostfound.dto.request.SearchLostItemRequest;
 import org.dongguk.lostfound.dto.response.LostItemDto;
 import org.dongguk.lostfound.dto.response.LostItemListDto;
 import org.dongguk.lostfound.dto.response.SearchResultDto;
+import org.dongguk.lostfound.dto.response.StatisticsDto;
+import org.dongguk.lostfound.domain.type.LostItemStatus;
 import org.dongguk.lostfound.repository.LostItemRepository;
 import org.dongguk.lostfound.repository.UserRepository;
 import org.springframework.beans.factory.annotation.Value;
@@ -57,8 +59,12 @@ public class LostItemService {
      * 3. Flask AI 서버에 이미지/설명 전송하여 임베딩 생성
      */
     @Transactional
-    public LostItemDto createLostItem(CreateLostItemRequest request) {
+    public LostItemDto createLostItem(Long userId, CreateLostItemRequest request) {
         log.info("Creating lost item: {}", request.itemName());
+
+        // 사용자 조회
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> CustomException.type(UserErrorCode.USER_NOT_FOUND));
 
         // 1. 이미지 업로드 (있는 경우)
         String imageUrl = null;
@@ -80,7 +86,8 @@ public class LostItemService {
                 request.foundDate(),
                 request.location(),
                 imageUrl,
-                null  // embeddingId는 나중에 업데이트
+                null,  // embeddingId는 나중에 업데이트
+                user
         );
 
         lostItem = lostItemRepository.save(lostItem);
@@ -237,9 +244,14 @@ public class LostItemService {
      * 분실물 삭제
      */
     @Transactional
-    public void deleteLostItem(Long id) {
+    public void deleteLostItem(Long userId, Long id) {
         LostItem lostItem = lostItemRepository.findById(id)
                 .orElseThrow(() -> new CustomException(GlobalErrorCode.NOT_FOUND));
+
+        // 본인이 등록한 분실물인지 확인
+        if (!lostItem.getUser().getId().equals(userId)) {
+            throw new CustomException(GlobalErrorCode.FORBIDDEN);
+        }
 
         // Flask AI 서버에 임베딩 삭제 요청
         try {
@@ -280,5 +292,31 @@ public class LostItemService {
             case "webp" -> "image/webp";
             default -> "application/octet-stream";
         };
+    }
+
+    /**
+     * 통계 데이터 조회
+     */
+    public StatisticsDto getStatistics() {
+        // 전체 분실물 개수
+        long totalItems = lostItemRepository.count();
+        
+        // 매칭된 분실물 개수 (MATCHED, COMPLETED 상태)
+        long matchedItems = lostItemRepository.countByStatus(LostItemStatus.MATCHED) 
+                + lostItemRepository.countByStatus(LostItemStatus.COMPLETED);
+        
+        // 회수 완료된 분실물 개수
+        long completedItems = lostItemRepository.countByStatus(LostItemStatus.COMPLETED);
+        
+        // 오늘 등록된 분실물 개수
+        java.time.LocalDateTime startOfDay = java.time.LocalDate.now().atStartOfDay();
+        long newItemsToday = lostItemRepository.countByCreatedAtAfter(startOfDay);
+        
+        return StatisticsDto.builder()
+                .totalItems(totalItems)
+                .matchedItems(matchedItems)
+                .completedItems(completedItems)
+                .newItemsToday(newItemsToday)
+                .build();
     }
 }

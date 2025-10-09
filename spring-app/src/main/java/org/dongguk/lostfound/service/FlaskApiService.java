@@ -11,6 +11,7 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -53,8 +54,11 @@ public class FlaskApiService {
             throw new RuntimeException("Failed to create embedding: " + response);
             
         } catch (IOException e) {
-            log.error("Error creating embedding for item {}", itemId, e);
+            log.error("Error reading image file for item {}", itemId, e);
             throw new RuntimeException("Failed to create embedding", e);
+        } catch (Exception e) {
+            log.warn("Flask AI 서버에 연결할 수 없습니다. 임베딩 생성을 건너뜁니다. itemId: {}", itemId);
+            // Flask 서버가 꺼져있어도 계속 진행
         }
     }
 
@@ -85,8 +89,9 @@ public class FlaskApiService {
             throw new RuntimeException("Failed to search embeddings: " + response);
             
         } catch (Exception e) {
-            log.error("Error searching embeddings with query: {}", query, e);
-            throw new RuntimeException("Failed to search embeddings", e);
+            log.warn("Flask AI 서버에 연결할 수 없습니다. 빈 결과를 반환합니다. query: {}", query);
+            // Flask 서버가 꺼져있을 때 빈 리스트 반환 (fallback)
+            return new ArrayList<>();
         }
     }
 
@@ -108,8 +113,8 @@ public class FlaskApiService {
             log.warn("Failed to delete embedding for item {}: {}", itemId, response);
             
         } catch (Exception e) {
-            log.error("Error deleting embedding for item {}", itemId, e);
-            // 삭제 실패해도 에러를 던지지 않음 (선택적)
+            log.warn("Flask AI 서버에 연결할 수 없습니다. 임베딩 삭제를 건너뜁니다. itemId: {}", itemId);
+            // Flask 서버가 꺼져있어도 계속 진행
         }
     }
 }

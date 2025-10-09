@@ -1,6 +1,8 @@
 package org.dongguk.lostfound.domain.lostitem;
 
 import org.dongguk.lostfound.domain.type.ItemCategory;
+import org.dongguk.lostfound.domain.type.LostItemStatus;
+import org.dongguk.lostfound.domain.user.User;
 import jakarta.persistence.*;
 import lombok.AccessLevel;
 import lombok.Builder;
@@ -8,6 +10,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 
 @Entity
 @Getter
@@ -41,6 +44,20 @@ public class LostItem {
     @Column(name = "embedding_id", unique = true)
     private Long embeddingId;
 
+    @Enumerated(EnumType.STRING)
+    @Column(name = "status", nullable = false, length = 50)
+    private LostItemStatus status;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id", nullable = false)
+    private User user;
+
+    @Column(name = "created_at", nullable = false)
+    private LocalDateTime createdAt;
+
+    @Column(name = "updated_at")
+    private LocalDateTime updatedAt;
+
     @Builder(access = AccessLevel.PRIVATE)
     private LostItem(String itemName,
                      ItemCategory category,
@@ -48,7 +65,11 @@ public class LostItem {
                      LocalDate foundDate,
                      String location,
                      String imageUrl,
-                     Long embeddingId) {
+                     Long embeddingId,
+                     LostItemStatus status,
+                     User user,
+                     LocalDateTime createdAt,
+                     LocalDateTime updatedAt) {
         this.itemName = itemName;
         this.category = category;
         this.description = description;
@@ -56,6 +77,10 @@ public class LostItem {
         this.location = location;
         this.imageUrl = imageUrl;
         this.embeddingId = embeddingId;
+        this.status = status;
+        this.user = user;
+        this.createdAt = createdAt;
+        this.updatedAt = updatedAt;
     }
 
     public static LostItem create(String itemName,
@@ -64,7 +89,8 @@ public class LostItem {
                                   LocalDate foundDate,
                                   String location,
                                   String imageUrl,
-                                  Long embeddingId) {
+                                  Long embeddingId,
+                                  User user) {
         return LostItem.builder()
                 .itemName(itemName)
                 .category(category)
@@ -73,10 +99,18 @@ public class LostItem {
                 .location(location)
                 .imageUrl(imageUrl)
                 .embeddingId(embeddingId)
+                .status(LostItemStatus.REGISTERED)
+                .user(user)
+                .createdAt(LocalDateTime.now())
                 .build();
     }
 
     public void updateEmbeddingId(Long embeddingId) {
         this.embeddingId = embeddingId;
+    }
+
+    public void updateStatus(LostItemStatus status) {
+        this.status = status;
+        this.updatedAt = LocalDateTime.now();
     }
 }
