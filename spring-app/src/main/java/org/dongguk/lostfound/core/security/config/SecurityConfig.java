@@ -95,8 +95,17 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         // 프리플라이트는 반드시 열어둔다
                         .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
+                        // 인증 API 허용
                         .requestMatchers(AuthConstant.AUTH_WHITELIST).permitAll()
+                        // 분실물 조회 API (GET만 허용, POST/DELETE는 인증 필수)
+                        .requestMatchers(HttpMethod.GET, "/api/v1/lost-items/**").permitAll()
+                        // AI 검색 API 허용
+                        .requestMatchers(HttpMethod.POST, "/api/v1/lost-items/search").permitAll()
+                        // 통계 API 허용
+                        .requestMatchers(HttpMethod.GET, "/api/v1/statistics/**").permitAll()
+                        // 정적 리소스 허용
                         .requestMatchers(PathRequest.toStaticResources().atCommonLocations()).permitAll()
+                        // 나머지는 인증 필수
                         .anyRequest().authenticated()
                 )
                 .exceptionHandling(e -> e.authenticationEntryPoint(jwtAuthenticationEntryPoint));
