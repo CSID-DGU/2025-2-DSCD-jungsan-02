@@ -5,18 +5,28 @@ import faiss
 import numpy as np
 from datetime import datetime
 import pickle
+import torch
+from typing import Optional
+from sentence_transformers import SentenceTransformer
+
+from services.captioning import generate_caption
+from services.text_processing import preprocess_text
 
 app = Flask(__name__)
 CORS(app)
+app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB upload limit
 
-# ========== FAISS 설정 ==========
+# ========== FAISS & 임베딩 모델 설정 ==========
 FAISS_INDEX_PATH = 'faiss_index.idx'
 FAISS_MAPPING_PATH = 'id_mapping.pkl'
-EMBEDDING_DIMENSION = 768  # BGE-M3 기본 차원 (AI 팀에서 사용하는 모델에 맞춰 조정 가능)
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "768"))
 
 # ========== 전역 변수 ==========
 faiss_index = None
 id_mapping = {}  # FAISS 인덱스 번호 -> MySQL item_id 매핑
+embedding_model: Optional[SentenceTransformer] = None
+embedding_device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def initialize_faiss():
     """FAISS 인덱스 초기화 또는 로드"""
@@ -28,7 +38,8 @@ def initialize_faiss():
             id_mapping = pickle.load(f)
         print(f"✅ FAISS 인덱스 로드: {faiss_index.ntotal}개 벡터")
     else:
-        faiss_index = faiss.IndexFlatL2(EMBEDDING_DIMENSION)
+        # 코사인 유사도 검색을 위해 내적 기반 인덱스 사용
+        faiss_index = faiss.IndexFlatIP(EMBEDDING_DIMENSION)
         id_mapping = {}
         print("✅ 새 FAISS 인덱스 생성")
 
@@ -41,27 +52,30 @@ def save_faiss():
 
 # ========== AI 팀이 구현할 함수들 (현재는 더미) ==========
 
+
+def load_embedding_model() -> SentenceTransformer:
+    """SentenceTransformer 모델을 1회 로드"""
+    global embedding_model
+    if embedding_model is None:
+        print(f"📦 BGE 모델 로드: {EMBEDDING_MODEL_NAME} (device={embedding_device})")
+        embedding_model = SentenceTransformer(
+            EMBEDDING_MODEL_NAME,
+            device=embedding_device,
+            trust_remote_code=True,
+        )
+        embedding_model.max_seq_length = 512
+    return embedding_model
+
 def describe_image_with_llava(image_bytes):
     """
-    LLaVA 모델을 사용하여 이미지에서 특징을 추출하고 자연어 설명을 생성
-    
-    TODO: AI 팀 구현 필요
-    
-    Args:
-        image_bytes (bytes): 이미지 파일의 바이트 데이터
-        
-    Returns:
-        str: 이미지에 대한 자연어 설명
-        예) "검은색 가죽 지갑으로 보입니다. 카드 슬롯이 여러 개 있으며, 모서리가 약간 닳아있습니다."
-        
-    구현 가이드:
-        1. image_bytes를 PIL Image 또는 적절한 형식으로 변환
-        2. LLaVA 모델에 입력
-        3. 분실물의 특징을 자세히 설명하는 문장 생성
-        4. 색상, 크기, 재질, 특징적인 부분 등을 포함
+    이미지에서 자연어 설명 생성 (Qwen 기반).
     """
-    # 더미 응답 (AI 팀 구현 전까지 사용)
-    return "검은색 지갑입니다"
+    try:
+        caption = generate_caption(image_bytes)
+        return preprocess_text(caption)
+    except Exception as exc:
+        print(f"⚠️ 이미지 캡셔닝 실패: {exc}")
+        return ""
 
 def create_embedding_vector(text):
     """
@@ -82,8 +96,23 @@ def create_embedding_vector(text):
         4. 정규화 (normalize) 적용 (코사인 유사도 사용 시)
         5. numpy array로 반환
     """
-    # 현재는 랜덤 벡터 반환 (AI 팀 구현 전까지 사용)
-    return np.random.rand(EMBEDDING_DIMENSION).astype('float32')
+    if not text or not text.strip():
+        raise ValueError("임베딩할 텍스트가 비어 있습니다.")
+
+    model = load_embedding_model()
+    embedding = model.encode(
+        [text],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )[0].astype("float32")
+
+    if embedding.shape[0] != EMBEDDING_DIMENSION:
+        raise ValueError(
+            f"임베딩 차원 불일치: 기대값={EMBEDDING_DIMENSION}, 실제값={embedding.shape[0]}"
+        )
+
+    return embedding
 
 def create_embedding_from_image(image_bytes):
     """
@@ -103,10 +132,22 @@ def create_embedding_from_image(image_bytes):
         3. 텍스트 임베딩과 같은 공간에 매핑되도록 처리
         4. 정규화 적용
     """
-    # 더미: 텍스트 임베딩과 동일한 방식으로 처리 (AI 팀 구현 전까지 사용)
-    # 실제로는 LLaVA로 이미지 설명 생성 후 임베딩
-    description = describe_image_with_llava(image_bytes)
-    return create_embedding_vector(description)
+    caption = describe_image_with_llava(image_bytes)
+    if not caption:
+        raise ValueError("이미지 캡셔닝 결과가 비어 있습니다.")
+    return create_embedding_vector(caption)
+
+
+@app.before_first_request
+def warmup_models():
+    """서버 기동 시 주요 모델을 미리 로드하여 콜드스타트를 줄임."""
+    try:
+        load_embedding_model()
+        preprocess_text("모델 워밍업")
+        app.logger.info("✅ 모델 워밍업 완료")
+    except Exception as exc:
+        app.logger.warning("⚠️ 모델 워밍업 실패: %s", exc)
+
 
 @app.route('/health')
 def health_check():
@@ -142,7 +183,8 @@ def create_embedding():
     """
     try:
         item_id = request.form.get('item_id')
-        description = request.form.get('description', '')
+        raw_description = request.form.get('description', '')
+        description = preprocess_text(raw_description)
         image_file = request.files.get('image')
         
         if not item_id:
@@ -154,11 +196,19 @@ def create_embedding():
         if image_file:
             image_bytes = image_file.read()
             image_description = describe_image_with_llava(image_bytes)
+            if not image_description and raw_description:
+                image_description = preprocess_text(raw_description)
             print(f"🖼️  이미지 분석 완료: {image_description[:50]}...")
         
         # 2. 이미지 묘사 + 사용자 설명 결합
         #    예) "검은색 가죽 지갑입니다. 신촌역 3번 출구에서 발견했습니다."
-        full_text = f"{image_description} {description}".strip()
+        parts = [p for p in [image_description, description] if p]
+        if not parts and raw_description:
+            parts.append(raw_description.strip())
+        full_text = " ".join(parts).strip()
+        
+        if not full_text:
+            return jsonify({'success': False, 'message': '설명 정보가 필요합니다.'}), 400
         
         # 3. 텍스트를 임베딩 벡터로 변환 (BGE-M3 사용)
         #    AI 팀: create_embedding_vector() 함수 구현 필요
@@ -211,7 +261,12 @@ def search_embedding():
     """
     try:
         data = request.get_json()
-        query = data.get('query', '')
+        raw_query = data.get('query', '')
+        if not raw_query or not raw_query.strip():
+            return jsonify({'success': False, 'message': '검색어 필요'}), 400
+        query = preprocess_text(raw_query)
+        if not query:
+            query = raw_query.strip()
         top_k = data.get('top_k', 10)
         
         if not query:
@@ -284,7 +339,10 @@ def search_by_image():
         # 1. 이미지를 임베딩 벡터로 변환
         #    AI 팀: create_embedding_from_image() 함수 구현 필요
         image_bytes = image_file.read()
-        query_vector = create_embedding_from_image(image_bytes)
+        try:
+            query_vector = create_embedding_from_image(image_bytes)
+        except ValueError as err:
+            return jsonify({'success': False, 'message': str(err)}), 400
         
         # 2. FAISS에서 유사도 검색
         k = min(top_k, faiss_index.ntotal)
@@ -344,7 +402,12 @@ def search_with_filters():
     """
     try:
         data = request.get_json()
-        query = data.get('query', '')
+        raw_query = data.get('query', '')
+        if not raw_query or not raw_query.strip():
+            return jsonify({'success': False, 'message': '검색어 필요'}), 400
+        query = preprocess_text(raw_query)
+        if not query:
+            query = raw_query.strip()
         top_k = data.get('top_k', 10)
         filters = data.get('filters', {})
         weights = data.get('weights', {
