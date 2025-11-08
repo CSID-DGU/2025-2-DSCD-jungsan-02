@@ -12,3 +12,4 @@ safetensors==0.4.3
 bitsandbytes==0.43.1
 soynlp==0.0.493
 qwen-vl-utils==0.0.10
+sentencepiece==0.1.99
