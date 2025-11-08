@@ -7,8 +7,8 @@ import torch
 from PIL import Image
 from transformers import (
     AutoProcessor,
+    AutoModelForCausalLM,
     BitsAndBytesConfig,
-    Qwen2_5_VLForConditionalGeneration,
 )
 
 DEFAULT_MODEL_ID = os.getenv(
@@ -23,14 +23,14 @@ def _load_processor(model_id: str = DEFAULT_MODEL_ID) -> AutoProcessor:
 
 
 @lru_cache(maxsize=1)
-def _load_model(model_id: str = DEFAULT_MODEL_ID) -> Qwen2_5_VLForConditionalGeneration:
+def _load_model(model_id: str = DEFAULT_MODEL_ID) -> AutoModelForCausalLM:
     quantization = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.float16,
     )
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         model_id,
         device_map="auto",
         trust_remote_code=True,
@@ -86,6 +86,9 @@ def generate_caption(
             temperature=0.2,
             do_sample=False,
         )
+
+    prompt_length = inputs["input_ids"].shape[1]
+    generated_ids = generated_ids[:, prompt_length:]
 
     outputs = processor.batch_decode(
         generated_ids,
