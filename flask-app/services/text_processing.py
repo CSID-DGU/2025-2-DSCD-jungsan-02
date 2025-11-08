@@ -3,7 +3,6 @@ from functools import lru_cache
 from typing import Optional
 
 import torch
-from pykospacing import Spacing
 from soynlp.normalizer import emoticon_normalize
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 
@@ -25,11 +24,6 @@ def _load_model() -> T5ForConditionalGeneration:
     return model
 
 
-@lru_cache(maxsize=1)
-def _load_spacing() -> Spacing:
-    return Spacing()
-
-
 def preprocess_text(raw_text: Optional[str]) -> str:
     """Apply typo correction, spacing, and emoji normalization."""
     if not raw_text:
@@ -41,7 +35,6 @@ def preprocess_text(raw_text: Optional[str]) -> str:
 
     tokenizer = _load_tokenizer()
     model = _load_model()
-    spacing = _load_spacing()
     device = model.device
 
     # Typo correction via T5 model
@@ -72,9 +65,10 @@ def preprocess_text(raw_text: Optional[str]) -> str:
     # Remove unsupported characters
     corrected = re.sub(r"[^가-힣0-9a-zA-Zㄱ-ㅎㅏ-ㅣ .,!?~]", "", corrected)
 
-    # Fix spacing & repeated emoticons
+    # Fix basic spacing & repeated emoticons
     corrected = corrected.replace(" ", "")
-    corrected = spacing(corrected)
+    corrected = re.sub(r'([가-힣0-9a-zA-Z])([,.!?])', r'\1 \2', corrected)
+    corrected = re.sub(r'([,.!?])([가-힣0-9a-zA-Z])', r'\1 \2', corrected)
     corrected = emoticon_normalize(corrected, num_repeats=1)
 
     return corrected.strip()
