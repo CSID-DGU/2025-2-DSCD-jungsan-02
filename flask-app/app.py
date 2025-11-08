@@ -138,15 +138,22 @@ def create_embedding_from_image(image_bytes):
     return create_embedding_vector(caption)
 
 
-@app.before_first_request
 def warmup_models():
     """서버 기동 시 주요 모델을 미리 로드하여 콜드스타트를 줄임."""
+    global models_warmed
+    if models_warmed:
+        return
     try:
         load_embedding_model()
         preprocess_text("모델 워밍업")
+        models_warmed = True
         app.logger.info("✅ 모델 워밍업 완료")
     except Exception as exc:
         app.logger.warning("⚠️ 모델 워밍업 실패: %s", exc)
+
+
+models_warmed = False
+warmup_models()
 
 
 @app.route('/health')
