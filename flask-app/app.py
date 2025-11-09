@@ -17,7 +17,7 @@ CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB upload limit
 
 # ========== FAISS & 임베딩 모델 설정 ==========
-FAISS_STORAGE_DIR = os.getenv("FAISS_STORAGE_DIR", ".")
+FAISS_STORAGE_DIR = os.getenv("FAISS_STORAGE_DIR", "/app/faiss-data")
 FAISS_INDEX_PATH = os.path.join(FAISS_STORAGE_DIR, 'faiss_index.idx')
 FAISS_MAPPING_PATH = os.path.join(FAISS_STORAGE_DIR, 'id_mapping.pkl')
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")

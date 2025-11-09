@@ -13,7 +13,7 @@ services:
       EMBEDDING_DIMENSION: "1024"
       FAISS_STORAGE_DIR: "/app/faiss-data"
     volumes:
-      - faiss-data:/app/faiss-data
+      - ./faiss-data:/app/faiss-data
     networks:
       - backend
 
@@ -29,6 +29,3 @@ services:
 
 networks:
   backend:
-
-volumes:
-  faiss-data:
