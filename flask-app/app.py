@@ -17,8 +17,9 @@ CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB upload limit
 
 # ========== FAISS & 임베딩 모델 설정 ==========
-FAISS_INDEX_PATH = 'faiss_index.idx'
-FAISS_MAPPING_PATH = 'id_mapping.pkl'
+FAISS_STORAGE_DIR = os.getenv("FAISS_STORAGE_DIR", "/app/faiss-data")
+FAISS_INDEX_PATH = os.path.join(FAISS_STORAGE_DIR, 'faiss_index.idx')
+FAISS_MAPPING_PATH = os.path.join(FAISS_STORAGE_DIR, 'id_mapping.pkl')
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "768"))
 
@@ -32,6 +33,8 @@ def initialize_faiss():
     """FAISS 인덱스 초기화 또는 로드"""
     global faiss_index, id_mapping
     
+    os.makedirs(FAISS_STORAGE_DIR, exist_ok=True)
+
     if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(FAISS_MAPPING_PATH):
         faiss_index = faiss.read_index(FAISS_INDEX_PATH)
         with open(FAISS_MAPPING_PATH, 'rb') as f:
@@ -45,6 +48,7 @@ def initialize_faiss():
 
 def save_faiss():
     """FAISS 스냅샷 저장"""
+    os.makedirs(FAISS_STORAGE_DIR, exist_ok=True)
     faiss.write_index(faiss_index, FAISS_INDEX_PATH)
     with open(FAISS_MAPPING_PATH, 'wb') as f:
         pickle.dump(id_mapping, f)
@@ -217,6 +221,8 @@ def create_embedding():
         if not full_text:
             return jsonify({'success': False, 'message': '설명 정보가 필요합니다.'}), 400
         
+        print(f"🧾 임베딩 텍스트: item_id={item_id}, text='{full_text[:120]}'")
+        
         # 3. 텍스트를 임베딩 벡터로 변환 (BGE-M3 사용)
         #    AI 팀: create_embedding_vector() 함수 구현 필요
         embedding_vector = create_embedding_vector(full_text)
@@ -292,6 +298,12 @@ def search_embedding():
         #    TODO: AI 팀에서 IndexFlatIP (내적 기반)로 변경 고려 가능
         k = min(top_k, faiss_index.ntotal)
         distances, indices = faiss_index.search(np.array([query_vector]), k)
+        debug_pairs = [
+            (int(idx), float(dist))
+            for idx, dist in zip(indices[0], distances[0])
+            if idx != -1
+        ]
+        print(f"📈 검색 디버그: query='{query[:50]}', 결과={debug_pairs}")
         
         # 3. FAISS 인덱스 번호 → MySQL item_id 변환
         #    유사도 순서대로 정렬된 상태 유지
