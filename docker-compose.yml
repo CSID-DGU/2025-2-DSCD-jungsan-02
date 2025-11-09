@@ -11,6 +11,9 @@ services:
       CAPTION_MODEL_ID: "Qwen/Qwen2.5-VL-1.8B-Instruct"
       EMBEDDING_MODEL_NAME: "BAAI/bge-m3"
       EMBEDDING_DIMENSION: "1024"
+      FAISS_STORAGE_DIR: "/app/faiss-data"
+    volumes:
+      - faiss-data:/app/faiss-data
     networks:
       - backend
 
@@ -26,3 +29,6 @@ services:
 
 networks:
   backend:
+
+volumes:
+  faiss-data:
