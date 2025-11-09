@@ -17,9 +17,8 @@ CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB upload limit
 
 # ========== FAISS & 임베딩 모델 설정 ==========
-FAISS_STORAGE_DIR = os.getenv("FAISS_STORAGE_DIR", "/app/faiss-data")
-FAISS_INDEX_PATH = os.path.join(FAISS_STORAGE_DIR, 'faiss_index.idx')
-FAISS_MAPPING_PATH = os.path.join(FAISS_STORAGE_DIR, 'id_mapping.pkl')
+FAISS_INDEX_PATH = 'faiss_index.idx'
+FAISS_MAPPING_PATH = 'id_mapping.pkl'
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "768"))
 
@@ -33,8 +32,6 @@ def initialize_faiss():
     """FAISS 인덱스 초기화 또는 로드"""
     global faiss_index, id_mapping
     
-    os.makedirs(FAISS_STORAGE_DIR, exist_ok=True)
-
     if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(FAISS_MAPPING_PATH):
         faiss_index = faiss.read_index(FAISS_INDEX_PATH)
         with open(FAISS_MAPPING_PATH, 'rb') as f:
@@ -48,7 +45,6 @@ def initialize_faiss():
 
 def save_faiss():
     """FAISS 스냅샷 저장"""
-    os.makedirs(FAISS_STORAGE_DIR, exist_ok=True)
     faiss.write_index(faiss_index, FAISS_INDEX_PATH)
     with open(FAISS_MAPPING_PATH, 'wb') as f:
         pickle.dump(id_mapping, f)
