@@ -34,7 +34,7 @@ def initialize_faiss():
     global faiss_index, id_mapping
     
     os.makedirs(FAISS_STORAGE_DIR, exist_ok=True)
-
+    
     if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(FAISS_MAPPING_PATH):
         faiss_index = faiss.read_index(FAISS_INDEX_PATH)
         with open(FAISS_MAPPING_PATH, 'rb') as f:

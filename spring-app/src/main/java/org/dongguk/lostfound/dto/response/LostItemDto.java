@@ -15,6 +15,9 @@ public record LostItemDto(
         String description,
         LocalDate foundDate,
         String location,
+        Double latitude,
+        Double longitude,
+        String brand,
         String imageUrl,
         Long embeddingId,
         LostItemStatus status,
@@ -28,6 +31,9 @@ public record LostItemDto(
                 .description(lostItem.getDescription())
                 .foundDate(lostItem.getFoundDate())
                 .location(lostItem.getLocation())
+                .latitude(lostItem.getLatitude())
+                .longitude(lostItem.getLongitude())
+                .brand(lostItem.getBrand())
                 .imageUrl(lostItem.getImageUrl())
                 .embeddingId(lostItem.getEmbeddingId())
                 .status(lostItem.getStatus())

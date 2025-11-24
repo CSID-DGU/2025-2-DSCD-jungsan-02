@@ -6,12 +6,13 @@ import org.dongguk.lostfound.domain.type.LostItemStatus;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
 
-public interface LostItemRepository extends JpaRepository<LostItem, Long> {
+public interface LostItemRepository extends JpaRepository<LostItem, Long>, JpaSpecificationExecutor<LostItem> {
     Page<LostItem> findByCategory(ItemCategory category, Pageable pageable);
     Page<LostItem> findByFoundDateBetween(LocalDate startDate, LocalDate endDate, Pageable pageable);
     Page<LostItem> findByLocation(String location, Pageable pageable);

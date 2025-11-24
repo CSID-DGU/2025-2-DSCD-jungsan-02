@@ -38,6 +38,15 @@ public class LostItem {
     @Column(name = "location", nullable = false, length = 255)
     private String location;
 
+    @Column(name = "latitude")
+    private Double latitude;
+
+    @Column(name = "longitude")
+    private Double longitude;
+
+    @Column(name = "brand", length = 100)
+    private String brand;
+
     @Column(name = "image_url", length = 500)
     private String imageUrl;
 
@@ -64,6 +73,9 @@ public class LostItem {
                      String description,
                      LocalDate foundDate,
                      String location,
+                     Double latitude,
+                     Double longitude,
+                     String brand,
                      String imageUrl,
                      Long embeddingId,
                      LostItemStatus status,
@@ -75,6 +87,9 @@ public class LostItem {
         this.description = description;
         this.foundDate = foundDate;
         this.location = location;
+        this.latitude = latitude;
+        this.longitude = longitude;
+        this.brand = brand;
         this.imageUrl = imageUrl;
         this.embeddingId = embeddingId;
         this.status = status;
@@ -88,6 +103,9 @@ public class LostItem {
                                   String description,
                                   LocalDate foundDate,
                                   String location,
+                                  Double latitude,
+                                  Double longitude,
+                                  String brand,
                                   String imageUrl,
                                   Long embeddingId,
                                   User user) {
@@ -97,6 +115,9 @@ public class LostItem {
                 .description(description)
                 .foundDate(foundDate)
                 .location(location)
+                .latitude(latitude)
+                .longitude(longitude)
+                .brand(brand)
                 .imageUrl(imageUrl)
                 .embeddingId(embeddingId)
                 .status(LostItemStatus.REGISTERED)

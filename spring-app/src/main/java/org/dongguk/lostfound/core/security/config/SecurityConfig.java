@@ -103,6 +103,9 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.POST, "/api/v1/lost-items/search").permitAll()
                         // 통계 API 허용
                         .requestMatchers(HttpMethod.GET, "/api/v1/statistics/**").permitAll()
+                        // 보관소 검색 API 허용
+                        .requestMatchers(HttpMethod.POST, "/api/v1/custody-locations/nearby").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/v1/custody-locations").permitAll()
                         // 정적 리소스 허용
                         .requestMatchers(PathRequest.toStaticResources().atCommonLocations()).permitAll()
                         // 나머지는 인증 필수

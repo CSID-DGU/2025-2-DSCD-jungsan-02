@@ -11,6 +11,9 @@ public record CreateLostItemRequest(
         String description,
         LocalDate foundDate,
         String location,
+        Double latitude,
+        Double longitude,
+        String brand,
         MultipartFile image
 ) {
 }

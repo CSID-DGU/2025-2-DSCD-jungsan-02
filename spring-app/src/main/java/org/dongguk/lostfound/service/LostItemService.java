@@ -2,37 +2,32 @@ package org.dongguk.lostfound.service;
 
 import com.google.cloud.storage.BlobInfo;
 import com.google.cloud.storage.Storage;
-import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dongguk.lostfound.core.exception.CustomException;
 import org.dongguk.lostfound.core.exception.GlobalErrorCode;
 import org.dongguk.lostfound.domain.lostitem.LostItem;
 import org.dongguk.lostfound.domain.type.ItemCategory;
+import org.dongguk.lostfound.domain.type.LostItemStatus;
 import org.dongguk.lostfound.domain.user.User;
 import org.dongguk.lostfound.domain.user.UserErrorCode;
 import org.dongguk.lostfound.dto.request.CreateLostItemRequest;
+import org.dongguk.lostfound.dto.request.FilterLostItemRequest;
 import org.dongguk.lostfound.dto.request.SearchLostItemRequest;
 import org.dongguk.lostfound.dto.response.LostItemDto;
 import org.dongguk.lostfound.dto.response.LostItemListDto;
-import org.dongguk.lostfound.dto.response.SearchResultDto;
 import org.dongguk.lostfound.dto.response.StatisticsDto;
-import org.dongguk.lostfound.domain.type.LostItemStatus;
 import org.dongguk.lostfound.repository.LostItemRepository;
 import org.dongguk.lostfound.repository.UserRepository;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.core.io.ByteArrayResource;
-import org.springframework.core.io.Resource;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
-import org.springframework.http.MediaType;
-import org.springframework.http.client.MultipartBodyBuilder;
+import org.springframework.data.jpa.domain.Specification;
+import jakarta.persistence.criteria.Predicate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.client.RestClient;
-import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.time.LocalDate;
@@ -47,7 +42,6 @@ public class LostItemService {
     @Value("${cloud.storage.bucket}")
     private String BUCKET_NAME;
     private final Storage storage;
-    private final RestClient flaskRestClient;
     private final FlaskApiService flaskApiService;
     private final UserRepository userRepository;
     private final LostItemRepository lostItemRepository;
@@ -85,6 +79,9 @@ public class LostItemService {
                 request.description(),
                 request.foundDate(),
                 request.location(),
+                request.latitude(),
+                request.longitude(),
+                request.brand(),
                 imageUrl,
                 null,  // embeddingId는 나중에 업데이트
                 user
@@ -196,18 +193,82 @@ public class LostItemService {
     }
 
     /**
+     * 통합 필터링 조회 (카테고리, 장소, 날짜 범위를 동시에 적용)
+     */
+    public LostItemListDto filterLostItems(FilterLostItemRequest request) {
+        Specification<LostItem> spec = buildSpecification(request);
+        Pageable pageable = PageRequest.of(request.page(), request.size(), Sort.by(Sort.Direction.DESC, "foundDate"));
+        Page<LostItem> itemPage = lostItemRepository.findAll(spec, pageable);
+
+        List<LostItemDto> items = itemPage.getContent().stream()
+                .map(LostItemDto::from)
+                .toList();
+
+        return LostItemListDto.builder()
+                .items(items)
+                .totalCount((int) itemPage.getTotalElements())
+                .page(request.page())
+                .size(request.size())
+                .build();
+    }
+
+    /**
+     * 필터 조건에 따라 Specification 생성
+     */
+    private Specification<LostItem> buildSpecification(FilterLostItemRequest request) {
+        return (root, query, cb) -> {
+            List<Predicate> predicates = new java.util.ArrayList<>();
+
+            // 카테고리 필터
+            if (request.category() != null) {
+                predicates.add(cb.equal(root.get("category"), request.category()));
+            }
+
+            // 장소 필터 (부분 일치)
+            if (request.location() != null && !request.location().trim().isEmpty()) {
+                predicates.add(cb.like(
+                    cb.lower(root.get("location")),
+                    "%" + request.location().toLowerCase().trim() + "%"
+                ));
+            }
+
+            // 브랜드 필터 (부분 일치)
+            if (request.brand() != null && !request.brand().trim().isEmpty()) {
+                predicates.add(cb.like(
+                    cb.lower(root.get("brand")),
+                    "%" + request.brand().toLowerCase().trim() + "%"
+                ));
+            }
+
+            // 날짜 필터 (해당 날짜 이후)
+            if (request.foundDateAfter() != null) {
+                predicates.add(cb.greaterThanOrEqualTo(root.get("foundDate"), request.foundDateAfter()));
+            }
+
+            return cb.and(predicates.toArray(new Predicate[0]));
+        };
+    }
+
+    /**
      * AI 검색 (자연어 검색)
      * 1. Flask AI 서버에 검색어 전송
      * 2. 유사한 분실물 ID 리스트 받음
      * 3. MySQL에서 해당 분실물들 조회
+     * 4. 필터가 있으면 필터 적용
      */
     public LostItemListDto searchLostItems(SearchLostItemRequest request) {
-        log.info("Searching lost items with query: {}", request.query());
+        log.info("Searching lost items with query: {}, filters: category={}, location={}, brand={}, foundDateAfter={}", 
+                request.query(), request.category(), request.location(), request.brand(), request.foundDateAfter());
 
-        // 1. Flask AI 서버에 검색 요청
+        // 1. Flask AI 서버에 검색 요청 (필터를 고려하여 더 많이 가져옴)
+        int searchTopK = request.topK();
+        if (hasFilters(request)) {
+            // 필터가 있으면 더 많이 가져와서 필터링 후 상위 결과 반환
+            searchTopK = request.topK() * 3;
+        }
         List<Long> itemIds = flaskApiService.searchSimilarItems(
                 request.query(),
-                request.topK()
+                searchTopK
         );
 
         if (itemIds.isEmpty()) {
@@ -222,14 +283,25 @@ public class LostItemService {
         // 2. MySQL에서 해당 분실물들 조회
         List<LostItem> lostItems = lostItemRepository.findAllById(itemIds);
 
-        // 3. 검색 결과 순서대로 정렬 (FAISS에서 반환된 순서 유지)
+        // 3. 필터 적용 (필터가 있는 경우)
+        final List<LostItem> filteredItems;
+        if (hasFilters(request)) {
+            filteredItems = lostItems.stream()
+                    .filter(item -> matchesFilters(item, request))
+                    .toList();
+        } else {
+            filteredItems = lostItems;
+        }
+
+        // 4. 검색 결과 순서대로 정렬 (FAISS에서 반환된 순서 유지)
         List<LostItemDto> items = itemIds.stream()
-                .map(id -> lostItems.stream()
+                .map(id -> filteredItems.stream()
                         .filter(item -> item.getId().equals(id))
                         .findFirst()
                         .map(LostItemDto::from)
                         .orElse(null))
                 .filter(item -> item != null)
+                .limit(request.topK()) // 최종 결과는 요청한 개수만큼만
                 .toList();
 
         return LostItemListDto.builder()
@@ -238,6 +310,51 @@ public class LostItemService {
                 .page(0)
                 .size(items.size())
                 .build();
+    }
+
+    /**
+     * 필터가 있는지 확인
+     */
+    private boolean hasFilters(SearchLostItemRequest request) {
+        return request.category() != null
+                || (request.location() != null && !request.location().trim().isEmpty())
+                || (request.brand() != null && !request.brand().trim().isEmpty())
+                || request.foundDateAfter() != null;
+    }
+
+    /**
+     * 아이템이 필터 조건에 맞는지 확인
+     */
+    private boolean matchesFilters(LostItem item, SearchLostItemRequest request) {
+        // 카테고리 필터
+        if (request.category() != null && !item.getCategory().equals(request.category())) {
+            return false;
+        }
+
+        // 장소 필터 (부분 일치)
+        if (request.location() != null && !request.location().trim().isEmpty()) {
+            String location = request.location().toLowerCase().trim();
+            if (item.getLocation() == null || !item.getLocation().toLowerCase().contains(location)) {
+                return false;
+            }
+        }
+
+        // 브랜드 필터 (부분 일치)
+        if (request.brand() != null && !request.brand().trim().isEmpty()) {
+            String brand = request.brand().toLowerCase().trim();
+            if (item.getBrand() == null || !item.getBrand().toLowerCase().contains(brand)) {
+                return false;
+            }
+        }
+
+        // 날짜 필터 (해당 날짜 이후)
+        if (request.foundDateAfter() != null) {
+            if (item.getFoundDate() == null || item.getFoundDate().isBefore(request.foundDateAfter())) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**

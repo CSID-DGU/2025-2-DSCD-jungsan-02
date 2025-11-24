@@ -4,6 +4,7 @@ import lombok.RequiredArgsConstructor;
 import org.dongguk.lostfound.core.annotation.UserId;
 import org.dongguk.lostfound.domain.type.ItemCategory;
 import org.dongguk.lostfound.dto.request.CreateLostItemRequest;
+import org.dongguk.lostfound.dto.request.FilterLostItemRequest;
 import org.dongguk.lostfound.dto.request.SearchLostItemRequest;
 import org.dongguk.lostfound.dto.response.LostItemDto;
 import org.dongguk.lostfound.dto.response.LostItemListDto;
@@ -33,10 +34,13 @@ public class LostItemController {
             @RequestParam String description,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate foundDate,
             @RequestParam String location,
+            @RequestParam(required = false) Double latitude,
+            @RequestParam(required = false) Double longitude,
+            @RequestParam(required = false) String brand,
             @RequestParam(required = false) MultipartFile image
     ) {
         CreateLostItemRequest request = new CreateLostItemRequest(
-                itemName, category, description, foundDate, location, image
+                itemName, category, description, foundDate, location, latitude, longitude, brand, image
         );
         
         LostItemDto result = lostItemService.createLostItem(userId, request);
@@ -103,6 +107,17 @@ public class LostItemController {
             @RequestParam(defaultValue = "20") int size
     ) {
         LostItemListDto result = lostItemService.getLostItemsByLocation(location, page, size);
+        return ResponseEntity.ok(result);
+    }
+
+    /**
+     * 통합 필터링 (카테고리, 장소, 날짜 범위를 동시에 적용)
+     */
+    @PostMapping("/filter")
+    public ResponseEntity<LostItemListDto> filterLostItems(
+            @RequestBody FilterLostItemRequest request
+    ) {
+        LostItemListDto result = lostItemService.filterLostItems(request);
         return ResponseEntity.ok(result);
     }
 
