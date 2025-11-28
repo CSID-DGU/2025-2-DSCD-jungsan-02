@@ -157,7 +157,7 @@ def warmup_models():
 
 
 models_warmed = False
-warmup_models()
+warmup_models()  # 각 워커 시작 시 모델 로드
 
 
 @app.route('/health')

@@ -11,9 +11,10 @@ import os
 # - 각 워커당 총: ~2-3GB
 # 
 # 15GB VRAM 기준:
-# - 안전: 5-6개 워커 (각 2.5GB)
-# - 최적: 6개 워커 (각 2.5GB, 시스템 오버헤드 고려)
-workers = int(os.getenv('GUNICORN_WORKERS', 6))  # 기본값: 6개 워커 (15GB VRAM 기준)
+# - 안전: 3-4개 워커 (각 3-4GB, 시스템 오버헤드 고려)
+# - 실제로는 각 워커가 독립적으로 모델을 로드하므로 더 많은 메모리 필요
+# - 시스템 메모리(RAM)도 고려해야 함
+workers = int(os.getenv('GUNICORN_WORKERS', 3))  # 기본값: 3개 워커 (안정성 우선)
 
 # 워커 타입: sync (동기) 또는 gevent (비동기)
 worker_class = 'sync'
