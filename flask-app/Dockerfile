@@ -24,5 +24,6 @@ COPY . .
 # 포트 오픈
 EXPOSE 5001
 
-# Flask 앱 실행
-CMD ["python", "app.py"]
+# Gunicorn으로 Flask 앱 실행 (멀티 워커)
+# 워커 수는 환경 변수로 설정 가능 (기본값: 6)
+CMD ["gunicorn", "--config", "gunicorn_config.py", "app:app"]

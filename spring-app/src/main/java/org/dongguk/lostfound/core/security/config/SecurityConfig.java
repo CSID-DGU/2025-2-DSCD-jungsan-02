@@ -106,6 +106,8 @@ public class SecurityConfig {
                         // 보관소 검색 API 허용
                         .requestMatchers(HttpMethod.POST, "/api/v1/custody-locations/nearby").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/custody-locations").permitAll()
+                        // 개발용 CSV 임포트 API (프로덕션에서는 제거하거나 인증 필요)
+                        .requestMatchers("/api/v1/admin/csv-import/**").permitAll()
                         // 정적 리소스 허용
                         .requestMatchers(PathRequest.toStaticResources().atCommonLocations()).permitAll()
                         // 나머지는 인증 필수

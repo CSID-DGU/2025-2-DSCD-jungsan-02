@@ -500,10 +500,12 @@ def delete_embedding(item_id):
         print(f"❌ 삭제 실패: {str(e)}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
+# Gunicorn으로 실행할 때도 FAISS 초기화
+# 각 워커 프로세스가 시작될 때마다 초기화됨
+initialize_faiss()
+
 if __name__ == '__main__':
-    # FAISS 초기화
-    initialize_faiss()
-    
+    # 개발 모드에서 직접 실행할 때만 사용
     port = int(os.environ.get('PORT', 5001))
     debug = os.environ.get('DEBUG', 'False').lower() == 'true'
     
