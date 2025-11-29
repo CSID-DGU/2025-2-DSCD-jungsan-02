@@ -28,10 +28,15 @@ faiss_index = None
 id_mapping = {}  # FAISS 인덱스 번호 -> MySQL item_id 매핑
 embedding_model: Optional[SentenceTransformer] = None
 embedding_device = "cuda" if torch.cuda.is_available() else "cpu"
+_faiss_initialized = False
+_model_loaded = False
 
 def initialize_faiss():
-    """FAISS 인덱스 초기화 또는 로드"""
-    global faiss_index, id_mapping
+    """FAISS 인덱스 초기화 또는 로드 (한 번만 실행)"""
+    global faiss_index, id_mapping, _faiss_initialized
+    
+    if _faiss_initialized:
+        return
     
     os.makedirs(FAISS_STORAGE_DIR, exist_ok=True)
     
@@ -45,6 +50,8 @@ def initialize_faiss():
         faiss_index = faiss.IndexFlatIP(EMBEDDING_DIMENSION)
         id_mapping = {}
         print("✅ 새 FAISS 인덱스 생성")
+    
+    _faiss_initialized = True
 
 def save_faiss():
     """FAISS 스냅샷 저장"""
@@ -59,8 +66,8 @@ def save_faiss():
 
 def load_embedding_model() -> SentenceTransformer:
     """SentenceTransformer 모델을 1회 로드"""
-    global embedding_model
-    if embedding_model is None:
+    global embedding_model, _model_loaded
+    if embedding_model is None or not _model_loaded:
         print(f"📦 BGE 모델 로드: {EMBEDDING_MODEL_NAME} (device={embedding_device})")
         embedding_model = SentenceTransformer(
             EMBEDDING_MODEL_NAME,
@@ -68,6 +75,8 @@ def load_embedding_model() -> SentenceTransformer:
             trust_remote_code=True,
         )
         embedding_model.max_seq_length = 512
+        _model_loaded = True
+        print(f"✅ BGE 모델 로드 완료")
     return embedding_model
 
 def describe_image_with_llava(image_bytes):
@@ -148,16 +157,19 @@ def warmup_models():
     if models_warmed:
         return
     try:
+        print("🔥 모델 워밍업 시작...")
         load_embedding_model()
         preprocess_text("모델 워밍업")
         models_warmed = True
-        app.logger.info("✅ 모델 워밍업 완료")
+        print("✅ 모델 워밍업 완료")
     except Exception as exc:
-        app.logger.warning("⚠️ 모델 워밍업 실패: %s", exc)
+        print(f"⚠️ 모델 워밍업 실패: {exc}")
 
 
 models_warmed = False
-warmup_models()  # 각 워커 시작 시 모델 로드
+# 각 워커 시작 시 모델과 FAISS 미리 로드
+initialize_faiss()
+warmup_models()
 
 
 @app.route('/health')
@@ -200,6 +212,10 @@ def create_embedding():
         
         if not item_id:
             return jsonify({'success': False, 'message': 'item_id 필요'}), 400
+        
+        # FAISS 인덱스 초기화 확인 (한 번만 실행)
+        if not _faiss_initialized:
+            initialize_faiss()
         
         # 1. 이미지 묘사 생성 (LLaVA 사용)
         #    AI 팀: describe_image_with_llava() 함수 구현 필요
@@ -285,8 +301,12 @@ def search_embedding():
         if not query:
             return jsonify({'success': False, 'message': '검색어 필요'}), 400
         
+        # FAISS 인덱스 초기화 확인 (한 번만 실행)
+        if not _faiss_initialized:
+            initialize_faiss()
+        
         # FAISS 인덱스가 비어있으면 빈 결과 반환
-        if faiss_index.ntotal == 0:
+        if faiss_index is None or faiss_index.ntotal == 0:
             return jsonify({'success': True, 'item_ids': []})
         
         # 1. 검색어를 임베딩 벡터로 변환 (BGE-M3 사용)
@@ -352,7 +372,11 @@ def search_by_image():
         if not image_file:
             return jsonify({'success': False, 'message': '이미지 파일 필요'}), 400
         
-        if faiss_index.ntotal == 0:
+        # FAISS 인덱스 초기화 확인 (한 번만 실행)
+        if not _faiss_initialized:
+            initialize_faiss()
+        
+        if faiss_index is None or faiss_index.ntotal == 0:
             return jsonify({'success': True, 'item_ids': []})
         
         # 1. 이미지를 임베딩 벡터로 변환
@@ -438,7 +462,11 @@ def search_with_filters():
         if not query:
             return jsonify({'success': False, 'message': '검색어 필요'}), 400
         
-        if faiss_index.ntotal == 0:
+        # FAISS 인덱스 초기화 확인 (한 번만 실행)
+        if not _faiss_initialized:
+            initialize_faiss()
+        
+        if faiss_index is None or faiss_index.ntotal == 0:
             return jsonify({'success': True, 'item_ids': []})
         
         # 1. 기본 시맨틱 검색
@@ -500,9 +528,8 @@ def delete_embedding(item_id):
         print(f"❌ 삭제 실패: {str(e)}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
-# Gunicorn으로 실행할 때도 FAISS 초기화
+# Gunicorn으로 실행할 때도 FAISS 초기화는 warmup_models()에서 수행됨
 # 각 워커 프로세스가 시작될 때마다 초기화됨
-initialize_faiss()
 
 if __name__ == '__main__':
     # 개발 모드에서 직접 실행할 때만 사용

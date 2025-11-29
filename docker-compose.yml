@@ -25,6 +25,8 @@ services:
       - flask-app
     ports:
       - "8080:8080"
+    volumes:
+      - /home/mj:/data  # 호스트의 /home/mj를 컨테이너의 /data로 마운트
     networks:
       - backend
 
