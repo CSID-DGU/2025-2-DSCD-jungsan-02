@@ -143,7 +143,19 @@ public class CsvDataImportService {
      * - 임베딩 생성을 비동기 병렬로 처리하여 성능 향상
      */
     public ImportResult importLostItems(String csvFilePath) {
-        log.info("분실물 데이터 임포트 시작: {}", csvFilePath);
+        return importLostItems(csvFilePath, Integer.MAX_VALUE);
+    }
+
+    /**
+     * 분실물 데이터 CSV 파일 임포트 (제한 개수 지정)
+     * 테스트용으로 지정된 개수만큼만 임포트
+     * 
+     * @param csvFilePath CSV 파일 경로
+     * @param limit 최대 저장할 개수 (저장된 개수 기준)
+     * @return 임포트 결과
+     */
+    public ImportResult importLostItems(String csvFilePath, int limit) {
+        log.info("분실물 데이터 임포트 시작: {} (최대 {}개 저장)", csvFilePath, limit == Integer.MAX_VALUE ? "전체" : limit);
         
         int savedCount = 0;
         int skippedCount = 0;
@@ -165,6 +177,11 @@ public class CsvDataImportService {
             long processedLines = 0;
             
             while ((line = reader.readLine()) != null) {
+                // limit에 도달하면 종료
+                if (savedCount >= limit) {
+                    log.info("저장 개수 제한({}개)에 도달하여 임포트 중단", limit);
+                    break;
+                }
                 // 헤더 스킵
                 if (isFirstLine) {
                     isFirstLine = false;

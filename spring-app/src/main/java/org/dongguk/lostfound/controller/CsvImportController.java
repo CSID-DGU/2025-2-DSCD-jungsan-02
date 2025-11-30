@@ -40,5 +40,20 @@ public class CsvImportController {
         CsvDataImportService.ImportResult result = csvDataImportService.importLostItems(filePath);
         return ResponseEntity.ok(result);
     }
+
+    /**
+     * 분실물 데이터 테스트 임포트 (제한된 개수만)
+     * limit을 지정하지 않으면 전체 임포트, limit을 지정하면 해당 개수만큼만 임포트
+     * 예: POST /api/v1/admin/csv-import/lost-items/test?filePath=/path/to/251013_lost112_place.csv&limit=1000
+     */
+    @PostMapping("/lost-items/test")
+    public ResponseEntity<CsvDataImportService.ImportResult> importLostItemsTest(
+            @RequestParam String filePath,
+            @RequestParam(required = false) Integer limit
+    ) {
+        int actualLimit = (limit != null) ? limit : Integer.MAX_VALUE;
+        CsvDataImportService.ImportResult result = csvDataImportService.importLostItems(filePath, actualLimit);
+        return ResponseEntity.ok(result);
+    }
 }
 
