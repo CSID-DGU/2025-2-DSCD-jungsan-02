@@ -135,7 +135,8 @@ public class CsvDataImportService {
 
     /**
      * 분실물 데이터 CSV 파일 임포트
-     * 형식: MANAGE_ID,COLOR_NM,CUSTODY_PLC,ACQUSTN_THNG_PHOTO_URL,THNG_DTLS,NOTI_CONT,ACQUSTN_DE,SN_ID,THNG_CLASS_LARGE,THNG_CLASS_SMALL,LOCAL_IMAGE_PATH
+     * 형식: MANAGE_ID,COLOR_NM,CUSTODY_PLC,ACQUSTN_THNG_PHOTO_URL,THNG_DTLS,NOTI_CONT,ACQUSTN_DE,SN_ID,THNG_CLASS_LARGE,THNG_CLASS_SMALL
+     * (LOCAL_IMAGE_PATH 컬럼은 선택사항)
      * 
      * 개선사항:
      * - 배치마다 트랜잭션을 분리하여 DB에 즉시 커밋
@@ -175,7 +176,10 @@ public class CsvDataImportService {
                 try {
                     // CSV 파싱 (쉼표로 분리, 하지만 값 안에 쉼표가 있을 수 있으므로 주의)
                     String[] parts = parseCsvLine(line);
-                    if (parts.length < 11) {
+                    if (parts.length < 10) { // 최소 10개 컬럼 필요 (LOCAL_IMAGE_PATH는 선택사항)
+                        if (processedLines <= 10) { // 처음 10개만 로그 출력
+                            log.warn("CSV 컬럼 수 부족으로 스킵 (라인 {}): {}개 컬럼 (필요: 최소 10개)", processedLines, parts.length);
+                        }
                         skippedCount++;
                         continue;
                     }
@@ -190,6 +194,14 @@ public class CsvDataImportService {
                     // 필수 필드 검증
                     if (custodyPlace.isEmpty() || itemName.isEmpty() || description.isEmpty() || 
                         foundDateStr.isEmpty() || categoryStr.isEmpty()) {
+                        if (processedLines <= 10) { // 처음 10개만 로그 출력
+                            log.warn("필수 필드 누락으로 스킵 (라인 {}): custodyPlace={}, itemName={}, description={}, foundDate={}, category={}", 
+                                processedLines, custodyPlace.isEmpty() ? "비어있음" : "있음",
+                                itemName.isEmpty() ? "비어있음" : "있음",
+                                description.isEmpty() ? "비어있음" : "있음",
+                                foundDateStr.isEmpty() ? "비어있음" : foundDateStr,
+                                categoryStr.isEmpty() ? "비어있음" : categoryStr);
+                        }
                         skippedCount++;
                         continue;
                     }
@@ -198,8 +210,8 @@ public class CsvDataImportService {
                     // 이미지 다운로드 실패 시 DB 저장을 방지
                     if (!imageUrl.isEmpty()) {
                         if (!isImageUrlValid(imageUrl)) {
-                            if (processedLines % 100 == 0) { // 100개마다 한 번씩만 로그 출력
-                                log.debug("이미지 URL 접근 불가, 스킵: {} (처리된 라인: {})", imageUrl, processedLines);
+                            if (processedLines % 100 == 0 || processedLines <= 10) { // 처음 10개와 100개마다 로그 출력
+                                log.warn("이미지 URL 접근 불가, 스킵: {} (처리된 라인: {}, 카테고리: {})", imageUrl, processedLines, categoryStr);
                             }
                             skippedCount++;
                             continue; // 이미지가 없으면 DB에 저장하지 않음
@@ -208,6 +220,9 @@ public class CsvDataImportService {
                     
                     // 카테고리 필터링 (지갑, 가방, 의류만)
                     if (!ALLOWED_CATEGORIES.contains(categoryStr)) {
+                        if (processedLines % 1000 == 0 || processedLines <= 10) { // 처음 10개와 1000개마다 로그 출력
+                            log.info("카테고리 필터링으로 스킵: {} (처리된 라인: {})", categoryStr, processedLines);
+                        }
                         skippedCount++;
                         continue;
                     }
