@@ -134,31 +134,35 @@ def describe_image_with_llava(image_bytes):
         print(f"⚠️ 이미지 캡셔닝 실패: {exc}")
         return ""
 
-def create_embedding_vector(text):
+def create_embedding_vector(text, is_query: bool = False):
     """
     BGE-M3 모델을 사용하여 텍스트를 임베딩 벡터로 변환
     
-    TODO: AI 팀 구현 필요
-    
     Args:
-        text (str): 임베딩할 텍스트 (이미지 묘사 + 사용자 입력 설명)
-        
+        text (str): 임베딩할 텍스트
+        is_query (bool): 검색 쿼리인지 여부 (기본값: False)
+                        True인 경우 instruction 프리픽스가 이미 포함되어 있음
+    
     Returns:
         numpy.ndarray: shape (EMBEDDING_DIMENSION,) 임베딩 벡터
-        
-    구현 가이드:
-        1. BGE-M3 모델 로드 (한 번만 로드하고 재사용)
-        2. 텍스트를 토크나이즈
-        3. 모델에 입력하여 임베딩 벡터 추출
-        4. 정규화 (normalize) 적용 (코사인 유사도 사용 시)
-        5. numpy array로 반환
     """
     if not text or not text.strip():
         raise ValueError("임베딩할 텍스트가 비어 있습니다.")
 
     model = load_embedding_model()
+    
+    # BGE-M3는 instruction을 활용하면 검색 성능이 향상됨
+    # 저장 시: "이 문장을 기억합니다: " 프리픽스 사용
+    # 검색 시: "이 문장을 검색합니다: " 프리픽스 사용 (이미 적용됨)
+    if not is_query:
+        # 저장 시 instruction 프리픽스 추가
+        text_with_instruction = f"이 문장을 기억합니다: {text}"
+    else:
+        # 검색 시는 이미 프리픽스가 포함되어 있음
+        text_with_instruction = text
+    
     embedding = model.encode(
-        [text],
+        [text_with_instruction],
         convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=False,
@@ -192,7 +196,7 @@ def create_embedding_from_image(image_bytes):
     caption = describe_image_with_llava(image_bytes)
     if not caption:
         raise ValueError("이미지 캡셔닝 결과가 비어 있습니다.")
-    return create_embedding_vector(caption)
+    return create_embedding_vector(caption, is_query=False)
 
 
 def warmup_models():
@@ -288,20 +292,14 @@ def create_embedding():
         # 원본 텍스트 결합
         raw_full_text = " ".join(parts).strip()
         
-        # 3. 통합 전처리 (검색 시와 동일한 전처리 적용)
-        #    저장 시와 검색 시 동일한 전처리를 적용하여 일관성 보장
-        final_text = preprocess_text(raw_full_text)
+        # 3. 통합 전처리 (저장 시에는 맞춤법 교정 사용)
+        final_text = preprocess_text(raw_full_text, use_typo_correction=True)
         if not final_text or len(final_text.strip()) == 0:
-            # 전처리 실패 시 원본 사용 (공백 제거만)
+            # 전처리 실패 시 원본 사용
             final_text = raw_full_text.strip()
         
-        print(f"🧾 임베딩 텍스트: item_id={item_id}")
-        print(f"   원본: {raw_full_text[:100]}...")
-        print(f"   전처리 후: {final_text[:100]}...")
-        
-        # 4. 텍스트를 임베딩 벡터로 변환 (BGE-M3 사용)
-        #    검색 시와 동일한 방식으로 임베딩 생성
-        embedding_vector = create_embedding_vector(final_text)
+        # 4. 임베딩 벡터 생성 (저장 시이므로 is_query=False)
+        embedding_vector = create_embedding_vector(final_text, is_query=False)
         
         # 4. FAISS 인덱스에 벡터 추가 (스레드 안전하게 처리)
         with _faiss_lock:
@@ -403,13 +401,23 @@ def create_embeddings_batch():
                             if len(image_bytes) == 0:
                                 raise ValueError("이미지 파일이 비어있음")
                             image_description = describe_image_with_llava(image_bytes)
+                            # 디버깅: 이미지 캡셔닝 성공 로그 (처음 10개만)
+                            if int(item_id) <= 10:
+                                print(f"✅ 이미지 캡셔닝 성공 (item_id={item_id}): '{image_description[:100]}'")
                             break  # 성공 시 루프 종료
                         except Exception as e:
                             if attempt == max_retries - 1:
                                 print(f"⚠️ 이미지 다운로드/캡셔닝 실패 (item_id={item_id}, 시도 {attempt+1}/{max_retries}): {e}")
+                                # 디버깅: 이미지 캡셔닝 실패 로그 (처음 10개만)
+                                if int(item_id) <= 10:
+                                    print(f"   이미지 URL: {image_url}")
                             else:
                                 time.sleep(0.5 * (attempt + 1))  # 지수 백오프
                             # 마지막 시도 실패 시 텍스트로 진행
+                else:
+                    # 디버깅: 이미지 URL이 없는 경우 (처음 10개만)
+                    if int(item_id) <= 10:
+                        print(f"⚠️ 이미지 URL 없음 (item_id={item_id})")
                 
                 # 2. 분실물 제목 + 이미지 묘사 + 사용자 설명 결합
                 parts = []
@@ -429,12 +437,26 @@ def create_embeddings_batch():
                     }
                 
                 raw_full_text = " ".join(parts).strip()
+                
+                # 디버깅: 임베딩에 포함될 텍스트 로그 출력 (처음 10개만)
+                if int(item_id) <= 10:
+                    print(f"📝 [임베딩 디버그] item_id={item_id}")
+                    print(f"   - 제목: '{item_name}'")
+                    print(f"   - 이미지 캡셔닝: '{image_description[:100] if image_description else '(없음)'}'")
+                    print(f"   - 설명: '{raw_description[:100] if raw_description else '(없음)'}'")
+                    print(f"   - 결합된 텍스트 (전처리 전): '{raw_full_text[:200]}'")
+                
                 final_text = preprocess_text(raw_full_text)
                 if not final_text or len(final_text.strip()) == 0:
                     final_text = raw_full_text.strip()
                 
-                # 3. 임베딩 벡터 생성
-                embedding_vector = create_embedding_vector(final_text)
+                # 디버깅: 전처리 후 텍스트 (처음 10개만)
+                if int(item_id) <= 10:
+                    print(f"   - 전처리 후 텍스트: '{final_text[:200]}'")
+                    print(f"   - 최종 임베딩 텍스트 길이: {len(final_text)}")
+                
+                # 3. 임베딩 벡터 생성 (저장 시이므로 is_query=False)
+                embedding_vector = create_embedding_vector(final_text, is_query=False)
                 
                 # 4. FAISS 인덱스에 벡터 추가 (스레드 안전하게 처리)
                 faiss_idx = None
@@ -515,9 +537,13 @@ def search_embedding():
         raw_query = data.get('query', '')
         if not raw_query or not raw_query.strip():
             return jsonify({'success': False, 'message': '검색어 필요'}), 400
-        query = preprocess_text(raw_query)
-        if not query:
-            query = raw_query.strip()
+        
+        # 검색 쿼리 전처리 최소화: 원본 쿼리 우선 사용
+        # BGE-M3는 한국어를 잘 처리하므로 전처리를 최소화하는 것이 성능 향상에 도움됨
+        query = raw_query.strip()
+        
+        # 전처리는 선택적으로만 적용 (원본이 비어있을 때만)
+        # 맞춤법 교정 모델이 정확한 키워드를 변경할 수 있으므로 검색 시에는 사용하지 않음
         top_k = data.get('top_k', 10)
         
         if not query:
@@ -532,16 +558,19 @@ def search_embedding():
             return jsonify({'success': True, 'item_ids': []})
         
         # 1. 검색어를 임베딩 벡터로 변환 (BGE-M3 사용)
-        #    AI 팀: create_embedding_vector() 함수 구현 필요
-        query_vector = create_embedding_vector(query)
+        # BGE-M3는 instruction을 활용하면 검색 성능이 향상됨
+        # "이 문장을 검색합니다: " 프리픽스 추가
+        query_for_embedding = f"이 문장을 검색합니다: {query}"
+        query_vector = create_embedding_vector(query_for_embedding, is_query=True)
         
         # 2. FAISS에서 코사인 유사도 기반 Top-K 검색
         k = min(top_k, faiss_index.ntotal)
         
         # HNSW 인덱스인 경우 ef_search 파라미터 설정 (정확도와 성능 균형)
+        # 고정값 사용하여 검색 결과 일관성 유지
         if hasattr(faiss_index, 'hnsw'):
-            # k보다 충분히 큰 값으로 설정하여 정확도 향상
-            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 3)
+            # 고정값 사용 (검색마다 변경하지 않음)
+            faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
         
         # 검색 실행
         distances, indices = faiss_index.search(np.array([query_vector]), k)
@@ -623,9 +652,9 @@ def search_by_image():
         # 2. FAISS에서 유사도 검색
         k = min(top_k, faiss_index.ntotal)
         
-        # HNSW 인덱스인 경우 ef_search 파라미터 설정
+        # HNSW 인덱스인 경우 ef_search 파라미터 설정 (고정값 사용)
         if hasattr(faiss_index, 'hnsw'):
-            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 2)
+            faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
         
         distances, indices = faiss_index.search(np.array([query_vector]), k)
         
@@ -708,12 +737,13 @@ def search_with_filters():
             return jsonify({'success': True, 'item_ids': []})
         
         # 1. 기본 시맨틱 검색
-        query_vector = create_embedding_vector(query)
+        query_for_embedding = f"이 문장을 검색합니다: {query}"
+        query_vector = create_embedding_vector(query_for_embedding, is_query=True)
         k = min(top_k * 3, faiss_index.ntotal)  # 더 많이 가져와서 필터링
         
-        # HNSW 인덱스인 경우 ef_search 파라미터 설정
+        # HNSW 인덱스인 경우 ef_search 파라미터 설정 (고정값 사용)
         if hasattr(faiss_index, 'hnsw'):
-            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 2)
+            faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
         
         distances, indices = faiss_index.search(np.array([query_vector]), k)
         

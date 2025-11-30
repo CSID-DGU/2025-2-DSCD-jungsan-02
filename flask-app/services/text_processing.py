@@ -24,8 +24,15 @@ def _load_model() -> T5ForConditionalGeneration:
     return model
 
 
-def preprocess_text(raw_text: Optional[str]) -> str:
-    """Apply typo correction, spacing, and emoji normalization."""
+def preprocess_text(raw_text: Optional[str], use_typo_correction: bool = True) -> str:
+    """
+    텍스트 전처리 (맞춤법 교정, 공백 정규화)
+    
+    Args:
+        raw_text: 전처리할 텍스트
+        use_typo_correction: 맞춤법 교정 사용 여부 (기본값: True)
+                           False로 설정하면 공백 정규화만 수행
+    """
     if not raw_text:
         return ""
 
@@ -33,40 +40,52 @@ def preprocess_text(raw_text: Optional[str]) -> str:
     if not text:
         return ""
 
-    tokenizer = _load_tokenizer()
-    model = _load_model()
-    device = model.device
+    corrected = text
 
-    # Typo correction via T5 model
-    encoding = tokenizer(
-        f"맞춤법을 고쳐주세요: {text}",
-        return_tensors="pt",
-        truncation=True,
-        max_length=256,
-    )
-    input_ids = encoding.input_ids.to(device)
-    attention_mask = encoding.attention_mask.to(device)
+    # 맞춤법 교정 (선택적)
+    if use_typo_correction:
+        try:
+            tokenizer = _load_tokenizer()
+            model = _load_model()
+            device = model.device
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_length=128,
-            num_beams=5,
-            early_stopping=True,
-        )
+            # Typo correction via T5 model
+            encoding = tokenizer(
+                f"맞춤법을 고쳐주세요: {text}",
+                return_tensors="pt",
+                truncation=True,
+                max_length=256,
+            )
+            input_ids = encoding.input_ids.to(device)
+            attention_mask = encoding.attention_mask.to(device)
 
-    corrected = tokenizer.decode(
-        output_ids[0],
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=True,
-    )
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_length=128,
+                    num_beams=5,
+                    early_stopping=True,
+                )
 
-    # Remove unsupported characters
+            corrected = tokenizer.decode(
+                output_ids[0],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True,
+            )
+        except Exception as e:
+            # 맞춤법 교정 실패 시 원본 사용
+            print(f"⚠️ 맞춤법 교정 실패, 원본 사용: {e}")
+            corrected = text
+
+    # Remove unsupported characters (공백은 유지)
     corrected = re.sub(r"[^가-힣0-9a-zA-Zㄱ-ㅎㅏ-ㅣ .,!?~]", "", corrected)
 
+    # 공백 정규화 (연속된 공백을 하나로, 하지만 공백 자체는 유지)
+    corrected = re.sub(r'\s+', ' ', corrected)
+    
     # Fix basic spacing & repeated emoticons
-    corrected = corrected.replace(" ", "")
+    # 공백을 완전히 제거하지 않고, 적절한 공백만 유지
     corrected = re.sub(r'([가-힣0-9a-zA-Z])([,.!?])', r'\1 \2', corrected)
     corrected = re.sub(r'([,.!?])([가-힣0-9a-zA-Z])', r'\1 \2', corrected)
     corrected = emoticon_normalize(corrected, num_repeats=1)
