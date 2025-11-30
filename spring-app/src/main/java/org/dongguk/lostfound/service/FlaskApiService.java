@@ -9,13 +9,23 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.multipart.MultipartFile;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.dongguk.lostfound.domain.lostitem.LostItem;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -83,6 +93,17 @@ public class FlaskApiService {
 
             if (response != null && Boolean.TRUE.equals(response.get("success"))) {
                 List<Integer> itemIds = (List<Integer>) response.get("item_ids");
+                List<Double> scores = (List<Double>) response.get("scores");
+                
+                // 디버깅: 유사도 점수 확인
+                if (scores != null && !scores.isEmpty()) {
+                    log.info("Flask 검색 결과 - 상위 5개 유사도 점수: {}", 
+                            scores.stream()
+                                    .limit(5)
+                                    .map(score -> String.format("%.4f", score))
+                                    .collect(Collectors.joining(", ")));
+                }
+                
                 return itemIds.stream()
                         .map(Long::valueOf)
                         .toList();
@@ -197,6 +218,68 @@ public class FlaskApiService {
             } catch (Exception ex) {
                 log.warn("텍스트만으로 임베딩 생성도 실패: itemId={}", itemId, ex);
             }
+        }
+    }
+
+    /**
+     * Flask AI 서버에 배치 임베딩 생성 요청 (성능 최적화)
+     * 여러 아이템을 한 번에 처리하여 네트워크 오버헤드 감소
+     */
+    public void createEmbeddingsBatch(List<LostItem> items) {
+        if (items == null || items.isEmpty()) {
+            return;
+        }
+        
+        try {
+            // 배치 데이터 구성
+            List<Map<String, Object>> itemsData = new ArrayList<>();
+            for (LostItem item : items) {
+                Map<String, Object> itemData = new HashMap<>();
+                itemData.put("item_id", item.getId());
+                itemData.put("description", item.getDescription() != null ? item.getDescription() : "");
+                itemData.put("image_url", item.getImageUrl() != null ? item.getImageUrl() : "");
+                itemsData.add(itemData);
+            }
+            
+            // JSON으로 변환
+            ObjectMapper objectMapper = new ObjectMapper();
+            String itemsJson = objectMapper.writeValueAsString(itemsData);
+            
+            // 요청 본문 구성
+            MultiValueMap<String, String> formData = new LinkedMultiValueMap<>();
+            formData.add("items", itemsJson);
+            
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+            
+            HttpEntity<MultiValueMap<String, String>> requestEntity = new HttpEntity<>(formData, headers);
+            
+            Map<String, Object> response = flaskRestClient.post()
+                    .uri("/api/v1/embedding/create-batch")
+                    .body(requestEntity)
+                    .retrieve()
+                    .body(Map.class);
+            
+            if (response != null && Boolean.TRUE.equals(response.get("success"))) {
+                Map<String, Object> summary = (Map<String, Object>) response.get("summary");
+                if (summary != null) {
+                    Integer successful = (Integer) summary.get("successful");
+                    Integer failed = (Integer) summary.get("failed");
+                    log.info("배치 임베딩 생성 완료: {}개 성공, {}개 실패", successful, failed);
+                } else {
+                    log.info("배치 임베딩 생성 완료: {}개 아이템", items.size());
+                }
+                return;
+            }
+            
+            throw new RuntimeException("Failed to create batch embeddings: " + response);
+            
+        } catch (JsonProcessingException e) {
+            log.error("배치 데이터 JSON 변환 실패", e);
+            throw new RuntimeException("Failed to create batch embeddings", e);
+        } catch (Exception e) {
+            log.warn("Flask AI 서버 배치 API 호출 실패: {}", e.getMessage());
+            throw new RuntimeException("Failed to create batch embeddings", e);
         }
     }
 

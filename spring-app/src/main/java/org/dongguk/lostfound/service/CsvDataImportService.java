@@ -8,7 +8,6 @@ import org.dongguk.lostfound.domain.user.User;
 import org.dongguk.lostfound.repository.CustodyLocationRepository;
 import org.dongguk.lostfound.repository.LostItemRepository;
 import org.dongguk.lostfound.repository.UserRepository;
-import org.dongguk.lostfound.service.FlaskApiService;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -25,7 +24,6 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
-import java.util.stream.Collectors;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 /**
@@ -333,24 +331,46 @@ public class CsvDataImportService {
     
     /**
      * 임베딩 생성을 비동기 병렬로 처리
-     * 각 아이템마다 별도의 스레드에서 처리하여 성능 향상
-     * CallerRunsPolicy로 큐가 가득 차면 호출자 스레드에서 실행되어 거부되지 않음
+     * 배치 API를 사용하여 성능 향상 (네트워크 오버헤드 감소)
+     * 각 배치마다 여러 아이템을 한 번에 Flask 서버로 전송
      */
     private List<CompletableFuture<Void>> createEmbeddingsAsync(List<LostItem> savedItems) {
-        return savedItems.stream()
-            .map(item -> CompletableFuture.runAsync(() -> {
+        // 배치 크기 설정 (한 번에 처리할 아이템 수)
+        int batchSize = 20; // 배치 크기 조정 가능
+        
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        
+        // 배치 단위로 나누어 처리
+        for (int i = 0; i < savedItems.size(); i += batchSize) {
+            int end = Math.min(i + batchSize, savedItems.size());
+            List<LostItem> batch = savedItems.subList(i, end);
+            
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                 try {
-                    flaskApiService.createEmbeddingFromUrl(
-                        item.getId(),
-                        item.getDescription(),
-                        item.getImageUrl()
-                    );
+                    // 배치 API 사용
+                    flaskApiService.createEmbeddingsBatch(batch);
+                    log.debug("배치 임베딩 생성 완료: {}개 아이템", batch.size());
                 } catch (Exception e) {
-                    log.warn("임베딩 생성 실패 (나중에 재시도 가능): itemId={}", item.getId(), e);
-                    // 임베딩 생성 실패해도 계속 진행
+                    log.warn("배치 임베딩 생성 실패, 개별 처리로 전환: {}", e.getMessage());
+                    // 배치 실패 시 개별 처리로 fallback
+                    for (LostItem item : batch) {
+                        try {
+                            flaskApiService.createEmbeddingFromUrl(
+                                item.getId(),
+                                item.getDescription(),
+                                item.getImageUrl()
+                            );
+                        } catch (Exception ex) {
+                            log.warn("임베딩 생성 실패 (나중에 재시도 가능): itemId={}", item.getId(), ex);
+                        }
+                    }
                 }
-            }, embeddingExecutor))
-            .collect(Collectors.toList());
+            }, embeddingExecutor);
+            
+            futures.add(future);
+        }
+        
+        return futures;
     }
     
     /**

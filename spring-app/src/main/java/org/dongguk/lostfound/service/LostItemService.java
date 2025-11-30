@@ -29,6 +29,10 @@ import jakarta.persistence.criteria.Predicate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
 import java.io.IOException;
 import java.time.LocalDate;
 import java.util.List;
@@ -282,27 +286,33 @@ public class LostItemService {
 
         // 2. MySQL에서 해당 분실물들 조회
         List<LostItem> lostItems = lostItemRepository.findAllById(itemIds);
+        
+        // 3. Map으로 변환하여 O(1) 조회 성능 확보 (findAllById는 순서 보장 안 함)
+        Map<Long, LostItem> itemMap = lostItems.stream()
+                .collect(Collectors.toMap(LostItem::getId, item -> item));
 
-        // 3. 필터 적용 (필터가 있는 경우)
-        final List<LostItem> filteredItems;
-        if (hasFilters(request)) {
-            filteredItems = lostItems.stream()
-                    .filter(item -> matchesFilters(item, request))
-                    .toList();
-        } else {
-            filteredItems = lostItems;
-        }
-
-        // 4. 검색 결과 순서대로 정렬 (FAISS에서 반환된 순서 유지)
+        // 4. FAISS에서 반환된 순서대로 아이템 조회 및 필터 적용
         List<LostItemDto> items = itemIds.stream()
-                .map(id -> filteredItems.stream()
-                        .filter(item -> item.getId().equals(id))
-                        .findFirst()
-                        .map(LostItemDto::from)
-                        .orElse(null))
-                .filter(item -> item != null)
+                .map(itemMap::get)
+                .filter(Objects::nonNull)
+                .filter(item -> !hasFilters(request) || matchesFilters(item, request))
+                .map(LostItemDto::from)
                 .limit(request.topK()) // 최종 결과는 요청한 개수만큼만
                 .toList();
+
+        // 디버깅: 순서 및 유사도 점수 확인 로그
+        if (!items.isEmpty()) {
+            log.info("✅ 최종 검색 결과 순서 (상위 5개): {}", 
+                    items.stream()
+                            .limit(5)
+                            .map(item -> String.format("%d:%s", item.id(), item.itemName()))
+                            .collect(Collectors.joining(", ")));
+            log.info("📊 FAISS에서 받은 itemIds 순서 (상위 5개): {}", 
+                    itemIds.stream()
+                            .limit(5)
+                            .map(String::valueOf)
+                            .collect(Collectors.joining(", ")));
+        }
 
         return LostItemListDto.builder()
                 .items(items)

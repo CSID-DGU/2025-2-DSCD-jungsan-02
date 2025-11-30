@@ -46,11 +46,17 @@ def generate_caption(
 ) -> str:
     """
     Generate a Korean caption for the given image.
+    색상, 브랜드, 형태, 재질 등 구체적인 정보를 포함하도록 프롬프트 개선.
     """
     if not image_bytes:
         raise ValueError("이미지 데이터가 비어 있습니다.")
 
-    prompt = prompt or "이 이미지를 한국어로 한 문장으로 설명해줘."
+    # 개선된 프롬프트: 색상, 브랜드, 형태, 재질 등 구체적 정보 요청
+    prompt = prompt or (
+        "이 이미지의 분실물을 한국어로 자세히 설명해줘. "
+        "색상, 브랜드명(있다면), 형태, 재질, 특징 등을 구체적으로 포함해줘. "
+        "예: '빨간색 가죽 지갑', '검은색 나이키 운동화' 등으로 설명해줘."
+    )
 
     model_id = DEFAULT_MODEL_ID
     processor = _load_processor(model_id)

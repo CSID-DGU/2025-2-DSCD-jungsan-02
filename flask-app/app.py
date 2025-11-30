@@ -8,6 +8,11 @@ import pickle
 import torch
 from typing import Optional
 from sentence_transformers import SentenceTransformer
+import threading
+import concurrent.futures
+import requests
+import json
+import time
 
 from services.captioning import generate_caption
 from services.text_processing import preprocess_text
@@ -23,6 +28,12 @@ FAISS_MAPPING_PATH = os.path.join(FAISS_STORAGE_DIR, 'id_mapping.pkl')
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "768"))
 
+# FAISS 인덱스 타입 설정 (HNSW: 대량 데이터 검색 최적화, Flat: 소량 데이터)
+FAISS_INDEX_TYPE = os.getenv("FAISS_INDEX_TYPE", "HNSW")  # "HNSW" or "Flat"
+HNSW_M = int(os.getenv("HNSW_M", "32"))  # HNSW 파라미터: 연결 수 (16-64, 높을수록 정확하지만 느림)
+HNSW_EF_CONSTRUCTION = int(os.getenv("HNSW_EF_CONSTRUCTION", "200"))  # HNSW 빌드 시 탐색 범위
+HNSW_EF_SEARCH = int(os.getenv("HNSW_EF_SEARCH", "128"))  # HNSW 검색 시 탐색 범위 (높을수록 정확하지만 느림)
+
 # ========== 전역 변수 ==========
 faiss_index = None
 id_mapping = {}  # FAISS 인덱스 번호 -> MySQL item_id 매핑
@@ -30,9 +41,15 @@ embedding_model: Optional[SentenceTransformer] = None
 embedding_device = "cuda" if torch.cuda.is_available() else "cpu"
 _faiss_initialized = False
 _model_loaded = False
+_faiss_lock = threading.Lock()  # FAISS 인덱스 접근 동기화
 
 def initialize_faiss():
-    """FAISS 인덱스 초기화 또는 로드 (한 번만 실행)"""
+    """FAISS 인덱스 초기화 또는 로드 (한 번만 실행)
+    
+    인덱스 타입:
+    - IndexFlatIP: 정확하지만 느림 (소량 데이터용, < 10만개)
+    - IndexHNSWFlat: 빠르고 정확함 (대량 데이터용, > 10만개)
+    """
     global faiss_index, id_mapping, _faiss_initialized
     
     if _faiss_initialized:
@@ -41,15 +58,40 @@ def initialize_faiss():
     os.makedirs(FAISS_STORAGE_DIR, exist_ok=True)
     
     if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(FAISS_MAPPING_PATH):
+        # 기존 인덱스 로드 (타입 자동 감지)
         faiss_index = faiss.read_index(FAISS_INDEX_PATH)
         with open(FAISS_MAPPING_PATH, 'rb') as f:
             id_mapping = pickle.load(f)
-        print(f"✅ FAISS 인덱스 로드: {faiss_index.ntotal}개 벡터")
+        index_type_name = type(faiss_index).__name__
+        print(f"✅ FAISS 인덱스 로드: {faiss_index.ntotal}개 벡터 (타입: {index_type_name})")
+        
+        # HNSW 인덱스인 경우 ef_search 설정
+        if hasattr(faiss_index, 'hnsw'):
+            faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
+            print(f"   HNSW 파라미터 설정: ef_search={HNSW_EF_SEARCH}")
+        
+        # 인덱스 타입 불일치 경고 (설정과 다른 경우)
+        if FAISS_INDEX_TYPE.upper() == "HNSW" and "Flat" in index_type_name and "HNSW" not in index_type_name:
+            print(f"⚠️ 경고: 설정은 HNSW이지만 기존 인덱스는 {index_type_name}입니다.")
+            print(f"   기존 인덱스를 사용합니다. 새 인덱스를 원하면 기존 파일을 삭제하세요.")
+        elif FAISS_INDEX_TYPE.upper() == "FLAT" and "HNSW" in index_type_name:
+            print(f"⚠️ 경고: 설정은 Flat이지만 기존 인덱스는 {index_type_name}입니다.")
+            print(f"   기존 인덱스를 사용합니다. 새 인덱스를 원하면 기존 파일을 삭제하세요.")
     else:
-        # 코사인 유사도 검색을 위해 내적 기반 인덱스 사용
-        faiss_index = faiss.IndexFlatIP(EMBEDDING_DIMENSION)
+        # 인덱스 타입에 따라 선택
+        if FAISS_INDEX_TYPE.upper() == "HNSW":
+            # HNSW 인덱스: 대량 데이터 검색 최적화 (근사 최근접 이웃)
+            # IndexHNSWFlat: 내적 기반 + HNSW 그래프 구조
+            faiss_index = faiss.IndexHNSWFlat(EMBEDDING_DIMENSION, HNSW_M)
+            faiss_index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
+            faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
+            print(f"✅ HNSW FAISS 인덱스 생성 (M={HNSW_M}, ef_construction={HNSW_EF_CONSTRUCTION}, ef_search={HNSW_EF_SEARCH})")
+        else:
+            # Flat 인덱스: 정확한 검색 (소량 데이터용)
+            faiss_index = faiss.IndexFlatIP(EMBEDDING_DIMENSION)
+            print("✅ Flat FAISS 인덱스 생성 (정확한 검색)")
+        
         id_mapping = {}
-        print("✅ 새 FAISS 인덱스 생성")
     
     _faiss_initialized = True
 
@@ -82,10 +124,12 @@ def load_embedding_model() -> SentenceTransformer:
 def describe_image_with_llava(image_bytes):
     """
     이미지에서 자연어 설명 생성 (Qwen 기반).
+    원본 캡션을 반환하고, 전처리는 나중에 통합적으로 수행.
     """
     try:
         caption = generate_caption(image_bytes)
-        return preprocess_text(caption)
+        # 원본 캡션 반환 (전처리는 나중에 통합적으로 수행)
+        return caption.strip() if caption else ""
     except Exception as exc:
         print(f"⚠️ 이미지 캡셔닝 실패: {exc}")
         return ""
@@ -207,7 +251,6 @@ def create_embedding():
     try:
         item_id = request.form.get('item_id')
         raw_description = request.form.get('description', '')
-        description = preprocess_text(raw_description)
         image_file = request.files.get('image')
         
         if not item_id:
@@ -217,38 +260,50 @@ def create_embedding():
         if not _faiss_initialized:
             initialize_faiss()
         
-        # 1. 이미지 묘사 생성 (LLaVA 사용)
-        #    AI 팀: describe_image_with_llava() 함수 구현 필요
+        # 1. 이미지 묘사 생성 (Qwen 기반)
         image_description = ""
         if image_file:
             image_bytes = image_file.read()
             image_description = describe_image_with_llava(image_bytes)
             if not image_description and raw_description:
-                image_description = preprocess_text(raw_description)
-            print(f"🖼️  이미지 분석 완료: {image_description[:50]}...")
+                image_description = raw_description.strip()
+            print(f"🖼️  이미지 분석 완료 (원본): {image_description[:100]}...")
         
-        # 2. 이미지 묘사 + 사용자 설명 결합
-        #    예) "검은색 가죽 지갑입니다. 신촌역 3번 출구에서 발견했습니다."
-        parts = [p for p in [image_description, description] if p]
-        if not parts and raw_description:
+        # 2. 이미지 묘사 + 사용자 설명 결합 (원본 텍스트로 결합)
+        #    예) "빨간색 가죽 지갑입니다. 신촌역 3번 출구에서 발견했습니다."
+        parts = []
+        if image_description:
+            parts.append(image_description)
+        if raw_description and raw_description.strip():
             parts.append(raw_description.strip())
-        full_text = " ".join(parts).strip()
         
-        if not full_text:
+        if not parts:
             return jsonify({'success': False, 'message': '설명 정보가 필요합니다.'}), 400
         
-        print(f"🧾 임베딩 텍스트: item_id={item_id}, text='{full_text[:120]}'")
+        # 원본 텍스트 결합
+        raw_full_text = " ".join(parts).strip()
         
-        # 3. 텍스트를 임베딩 벡터로 변환 (BGE-M3 사용)
-        #    AI 팀: create_embedding_vector() 함수 구현 필요
-        embedding_vector = create_embedding_vector(full_text)
+        # 3. 통합 전처리 (검색 시와 동일한 전처리 적용)
+        #    저장 시와 검색 시 동일한 전처리를 적용하여 일관성 보장
+        final_text = preprocess_text(raw_full_text)
+        if not final_text or len(final_text.strip()) == 0:
+            # 전처리 실패 시 원본 사용 (공백 제거만)
+            final_text = raw_full_text.strip()
         
-        # 4. FAISS 인덱스에 벡터 추가
-        faiss_index.add(np.array([embedding_vector]))
-        faiss_idx = faiss_index.ntotal - 1
+        print(f"🧾 임베딩 텍스트: item_id={item_id}")
+        print(f"   원본: {raw_full_text[:100]}...")
+        print(f"   전처리 후: {final_text[:100]}...")
         
-        # 5. FAISS 인덱스 번호 ↔ MySQL item_id 매핑 저장
-        id_mapping[faiss_idx] = int(item_id)
+        # 4. 텍스트를 임베딩 벡터로 변환 (BGE-M3 사용)
+        #    검색 시와 동일한 방식으로 임베딩 생성
+        embedding_vector = create_embedding_vector(final_text)
+        
+        # 4. FAISS 인덱스에 벡터 추가 (스레드 안전하게 처리)
+        with _faiss_lock:
+            faiss_index.add(np.array([embedding_vector]))
+            faiss_idx = faiss_index.ntotal - 1
+            # 5. FAISS 인덱스 번호 ↔ MySQL item_id 매핑 저장
+            id_mapping[faiss_idx] = int(item_id)
         
         # 6. FAISS 인덱스 및 매핑 정보를 디스크에 저장 (영속성)
         save_faiss()
@@ -263,6 +318,163 @@ def create_embedding():
         
     except Exception as e:
         print(f"❌ 임베딩 생성 실패: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/v1/embedding/create-batch', methods=['POST'])
+def create_embeddings_batch():
+    """
+    분실물 등록 시 배치 임베딩 생성 및 FAISS 저장 (성능 최적화)
+    
+    여러 아이템을 한 번에 처리하여 네트워크 오버헤드 감소 및 처리 속도 향상
+    
+    Spring에서 받는 것:
+    - items: 아이템 리스트 (각 아이템은 다음 필드 포함)
+      - item_id: MySQL 분실물 ID (필수)
+      - description: 사용자가 입력한 분실물 설명 (선택)
+      - image_url: 이미지 URL (선택)
+      - image: 이미지 파일 (image_url이 없을 경우, 선택)
+    
+    Spring으로 보내는 것:
+    - success: 성공 여부
+    - results: 각 아이템별 결과 리스트
+      - item_id: 원본 ID
+      - success: 성공 여부
+      - message: 결과 메시지
+      - faiss_idx: FAISS 인덱스 번호 (성공 시)
+    """
+    try:
+        items_data = request.form.get('items')
+        if not items_data:
+            return jsonify({'success': False, 'message': 'items 데이터 필요'}), 400
+        
+        try:
+            items = json.loads(items_data)
+        except json.JSONDecodeError:
+            return jsonify({'success': False, 'message': 'items JSON 파싱 실패'}), 400
+        
+        if not isinstance(items, list) or len(items) == 0:
+            return jsonify({'success': False, 'message': 'items는 비어있지 않은 리스트여야 합니다'}), 400
+        
+        # FAISS 인덱스 초기화 확인
+        if not _faiss_initialized:
+            initialize_faiss()
+        
+        results = []
+        successful_count = 0
+        
+        # 배치 처리: 여러 이미지를 병렬로 처리
+        def process_item(item):
+            """단일 아이템 처리"""
+            item_id = item.get('item_id')
+            raw_description = item.get('description', '')
+            image_url = item.get('image_url', '')
+            
+            if not item_id:
+                return {
+                    'item_id': None,
+                    'success': False,
+                    'message': 'item_id 필요'
+                }
+            
+            try:
+                # 1. 이미지 다운로드 및 캡셔닝 (재시도 로직 포함)
+                image_description = ""
+                if image_url:
+                    max_retries = 2
+                    for attempt in range(max_retries):
+                        try:
+                            response = requests.get(
+                                image_url, 
+                                timeout=(5, 15),  # (연결 타임아웃, 읽기 타임아웃)
+                                stream=True,
+                                headers={'User-Agent': 'Mozilla/5.0'}  # 일부 서버에서 필요
+                            )
+                            response.raise_for_status()
+                            image_bytes = response.content
+                            if len(image_bytes) > 20 * 1024 * 1024:  # 20MB 제한
+                                raise ValueError("이미지 파일이 너무 큼")
+                            if len(image_bytes) == 0:
+                                raise ValueError("이미지 파일이 비어있음")
+                            image_description = describe_image_with_llava(image_bytes)
+                            break  # 성공 시 루프 종료
+                        except Exception as e:
+                            if attempt == max_retries - 1:
+                                print(f"⚠️ 이미지 다운로드/캡셔닝 실패 (item_id={item_id}, 시도 {attempt+1}/{max_retries}): {e}")
+                            else:
+                                time.sleep(0.5 * (attempt + 1))  # 지수 백오프
+                            # 마지막 시도 실패 시 텍스트로 진행
+                
+                # 2. 텍스트 결합 및 전처리
+                parts = []
+                if image_description:
+                    parts.append(image_description)
+                if raw_description and raw_description.strip():
+                    parts.append(raw_description.strip())
+                
+                if not parts:
+                    return {
+                        'item_id': int(item_id),
+                        'success': False,
+                        'message': '설명 정보가 필요합니다'
+                    }
+                
+                raw_full_text = " ".join(parts).strip()
+                final_text = preprocess_text(raw_full_text)
+                if not final_text or len(final_text.strip()) == 0:
+                    final_text = raw_full_text.strip()
+                
+                # 3. 임베딩 벡터 생성
+                embedding_vector = create_embedding_vector(final_text)
+                
+                # 4. FAISS 인덱스에 벡터 추가 (스레드 안전하게 처리)
+                faiss_idx = None
+                with _faiss_lock:
+                    faiss_index.add(np.array([embedding_vector]))
+                    faiss_idx = faiss_index.ntotal - 1
+                    id_mapping[faiss_idx] = int(item_id)
+                
+                return {
+                    'item_id': int(item_id),
+                    'success': True,
+                    'message': f'임베딩 생성 완료',
+                    'faiss_idx': faiss_idx
+                }
+                
+            except Exception as e:
+                print(f"❌ 배치 임베딩 생성 실패 (item_id={item_id}): {str(e)}")
+                return {
+                    'item_id': int(item_id) if item_id else None,
+                    'success': False,
+                    'message': str(e)
+                }
+        
+        # 병렬 처리 (최대 10개 동시 처리)
+        max_workers = min(10, len(items))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_item = {executor.submit(process_item, item): item for item in items}
+            for future in concurrent.futures.as_completed(future_to_item):
+                result = future.result()
+                results.append(result)
+                if result.get('success'):
+                    successful_count += 1
+        
+        # FAISS 인덱스 및 매핑 정보를 디스크에 저장 (배치 완료 후 한 번만)
+        save_faiss()
+        
+        print(f"✅ 배치 임베딩 생성 완료: {successful_count}/{len(items)}개 성공")
+        
+        return jsonify({
+            'success': True,
+            'results': results,
+            'summary': {
+                'total': len(items),
+                'successful': successful_count,
+                'failed': len(items) - successful_count
+            }
+        })
+        
+    except Exception as e:
+        print(f"❌ 배치 임베딩 생성 실패: {str(e)}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/api/v1/embedding/search', methods=['POST'])
@@ -314,9 +526,14 @@ def search_embedding():
         query_vector = create_embedding_vector(query)
         
         # 2. FAISS에서 코사인 유사도 기반 Top-K 검색
-        #    L2 거리 기반 검색 (작을수록 유사)
-        #    TODO: AI 팀에서 IndexFlatIP (내적 기반)로 변경 고려 가능
         k = min(top_k, faiss_index.ntotal)
+        
+        # HNSW 인덱스인 경우 ef_search 파라미터 설정 (정확도와 성능 균형)
+        if hasattr(faiss_index, 'hnsw'):
+            # k보다 충분히 큰 값으로 설정하여 정확도 향상
+            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 3)
+        
+        # 검색 실행
         distances, indices = faiss_index.search(np.array([query_vector]), k)
         debug_pairs = [
             (int(idx), float(dist))
@@ -328,15 +545,21 @@ def search_embedding():
         # 3. FAISS 인덱스 번호 → MySQL item_id 변환
         #    유사도 순서대로 정렬된 상태 유지
         item_ids = []
-        for idx in indices[0]:
-            if int(idx) in id_mapping:
+        scores = []
+        for idx, dist in zip(indices[0], distances[0]):
+            if int(idx) != -1 and int(idx) in id_mapping:
                 item_ids.append(id_mapping[int(idx)])
+                scores.append(float(dist))  # IndexFlatIP이므로 내적 값 (높을수록 유사)
         
+        # 디버깅: 유사도 점수와 함께 출력
+        result_pairs = list(zip(item_ids[:10], scores[:10]))
         print(f"🔍 자연어 검색 완료: query='{query[:30]}...', top_k={top_k}, 결과={len(item_ids)}개")
+        print(f"📊 상위 10개 유사도 점수: {result_pairs}")
         
         return jsonify({
             'success': True,
-            'item_ids': item_ids
+            'item_ids': item_ids,
+            'scores': scores  # 유사도 점수도 함께 반환
         })
         
     except Exception as e:
@@ -389,6 +612,11 @@ def search_by_image():
         
         # 2. FAISS에서 유사도 검색
         k = min(top_k, faiss_index.ntotal)
+        
+        # HNSW 인덱스인 경우 ef_search 파라미터 설정
+        if hasattr(faiss_index, 'hnsw'):
+            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 2)
+        
         distances, indices = faiss_index.search(np.array([query_vector]), k)
         
         # 3. FAISS 인덱스 번호 → MySQL item_id 변환
@@ -472,6 +700,11 @@ def search_with_filters():
         # 1. 기본 시맨틱 검색
         query_vector = create_embedding_vector(query)
         k = min(top_k * 3, faiss_index.ntotal)  # 더 많이 가져와서 필터링
+        
+        # HNSW 인덱스인 경우 ef_search 파라미터 설정
+        if hasattr(faiss_index, 'hnsw'):
+            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 2)
+        
         distances, indices = faiss_index.search(np.array([query_vector]), k)
         
         # 2. 초기 후보 추출
