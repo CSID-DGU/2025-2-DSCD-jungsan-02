@@ -34,12 +34,14 @@ public class CustodyLocationService {
 
     /**
      * 사용자 위치 기준으로 가까운 보관소 TopK 조회 (도보 거리 기준)
+     * 1차: 10km 반경 내 보관소 필터링
+     * 2차: 도보 거리 계산 후 상위 5개 반환
      */
     @Transactional(readOnly = true)
     public List<CustodyLocationDto> findNearbyCustodyLocations(NearbyCustodyLocationRequest request) {
         Double userLat = request.latitude();
         Double userLon = request.longitude();
-        Integer topK = request.topK() != null ? request.topK() : 10;
+        Integer topK = request.topK() != null ? request.topK() : 5; // 기본값 5개
 
         log.info("가까운 보관소 검색 요청: lat={}, lon={}, topK={}", userLat, userLon, topK);
 
@@ -51,10 +53,31 @@ public class CustodyLocationService {
             return new ArrayList<>();
         }
 
-        // 각 보관소까지의 도보 거리 계산
+        // 1차 필터링: 10km 반경 내 보관소만 선별
+        final double RADIUS_KM = 10.0;
+        final double RADIUS_METERS = RADIUS_KM * 1000.0;
+        
+        List<CustodyLocation> nearbyLocations = allLocations.stream()
+                .filter(location -> {
+                    double distance = calculateHaversineDistance(
+                            userLat, userLon,
+                            location.getLatitude(), location.getLongitude()
+                    );
+                    return distance <= RADIUS_METERS;
+                })
+                .collect(Collectors.toList());
+
+        log.info("10km 반경 내 보관소 개수: {}/{}", nearbyLocations.size(), allLocations.size());
+
+        if (nearbyLocations.isEmpty()) {
+            log.info("10km 반경 내 보관소가 없습니다.");
+            return new ArrayList<>();
+        }
+
+        // 2차: 각 보관소까지의 도보 거리 계산 (TMap API 사용)
         List<CustodyLocationDto> results = new ArrayList<>();
         
-        for (CustodyLocation location : allLocations) {
+        for (CustodyLocation location : nearbyLocations) {
             TmapApiService.TmapRouteResult routeResult = tmapApiService.getWalkingDistance(
                     userLat, userLon,
                     location.getLatitude(), location.getLongitude()
@@ -94,7 +117,7 @@ public class CustodyLocationService {
             }
         }
 
-        // 거리 기준으로 정렬하고 TopK 반환
+        // 도보 거리 기준으로 정렬하고 TopK 반환
         return results.stream()
                 .sorted(Comparator.comparingInt(CustodyLocationDto::walkingDistance))
                 .limit(topK)
