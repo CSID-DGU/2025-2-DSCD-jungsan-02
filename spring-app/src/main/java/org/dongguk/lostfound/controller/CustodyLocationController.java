@@ -32,7 +32,14 @@ public class CustodyLocationController {
             @RequestBody NearbyCustodyLocationRequest request
     ) {
         List<CustodyLocationDto> result = custodyLocationService.findNearbyCustodyLocations(request);
-        return ResponseEntity.ok(result);
+        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+        
+        // TMap API 쿼터 초과 상태를 헤더에 추가
+        if (custodyLocationService.isTmapQuotaExceeded()) {
+            headers.add("X-TMap-Quota-Exceeded", "true");
+        }
+        
+        return ResponseEntity.ok().headers(headers).body(result);
     }
 
     /**
@@ -45,7 +52,14 @@ public class CustodyLocationController {
             @RequestParam(required = false, defaultValue = "5") Integer topK
     ) {
         List<CustodyLocationDto> result = custodyLocationService.findNearbyCustodyLocationsByPlaceName(placeName, topK);
-        return ResponseEntity.ok(result);
+        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+        
+        // TMap API 쿼터 초과 상태를 헤더에 추가
+        if (custodyLocationService.isTmapQuotaExceeded()) {
+            headers.add("X-TMap-Quota-Exceeded", "true");
+        }
+        
+        return ResponseEntity.ok().headers(headers).body(result);
     }
 }
 

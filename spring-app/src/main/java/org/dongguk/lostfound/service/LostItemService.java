@@ -220,7 +220,7 @@ public class LostItemService {
         Double filterLon = request.locationLongitude();
         Double filterRadius = request.locationRadius();
         
-        // 장소명만 제공된 경우 좌표로 변환
+        // 장소명만 제공된 경우 좌표로 변환 (한 번만 호출)
         if ((filterLat == null || filterLon == null) && 
             request.location() != null && !request.location().trim().isEmpty()) {
             TmapApiService.TmapPlaceResult placeResult = tmapApiService.searchPlace(request.location().trim());
@@ -237,7 +237,8 @@ public class LostItemService {
         final Double finalFilterLon = filterLon;
         final Double finalFilterRadius = filterRadius;
         
-        Specification<LostItem> spec = buildSpecification(request);
+        // buildSpecification에 이미 변환된 좌표를 전달하여 중복 호출 방지
+        Specification<LostItem> spec = buildSpecification(request, finalFilterLat, finalFilterLon, finalFilterRadius);
         Pageable pageable = PageRequest.of(request.page(), request.size(), Sort.by(Sort.Direction.DESC, "foundDate"));
         Page<LostItem> itemPage = lostItemRepository.findAll(spec, pageable);
 
@@ -290,8 +291,15 @@ public class LostItemService {
 
     /**
      * 필터 조건에 따라 Specification 생성
+     * @param request 필터 요청
+     * @param filterLat 이미 변환된 위도 (null이면 request에서 가져오거나 변환 시도)
+     * @param filterLon 이미 변환된 경도 (null이면 request에서 가져오거나 변환 시도)
+     * @param filterRadius 반경 (미터)
      */
-    private Specification<LostItem> buildSpecification(FilterLostItemRequest request) {
+    private Specification<LostItem> buildSpecification(FilterLostItemRequest request, 
+                                                       Double filterLat, 
+                                                       Double filterLon, 
+                                                       Double filterRadius) {
         return (root, query, cb) -> {
             List<Predicate> predicates = new java.util.ArrayList<>();
 
@@ -301,7 +309,12 @@ public class LostItemService {
             }
 
             // 장소 필터 (좌표 기반 반경 필터링)
-            if (request.locationLatitude() != null && request.locationLongitude() != null) {
+            // 이미 변환된 좌표가 있으면 사용, 없으면 request에서 가져오기
+            Double lat = filterLat != null ? filterLat : request.locationLatitude();
+            Double lon = filterLon != null ? filterLon : request.locationLongitude();
+            Double radius = filterRadius != null ? filterRadius : request.locationRadius();
+            
+            if (lat != null && lon != null && radius != null) {
                 // 좌표 기반 반경 필터링
                 // 하버사인 공식으로 거리 계산하여 반경 내 아이템만 필터링
                 // MySQL에서는 직접 하버사인 공식을 사용할 수 없으므로,
@@ -310,44 +323,25 @@ public class LostItemService {
                 // 실제 거리는 애플리케이션 레벨에서 계산
                 
                 // 대략적인 반경 계산 (1도 ≈ 111km)
-                double radiusInDegrees = request.locationRadius() / 111000.0;
+                double radiusInDegrees = radius / 111000.0;
                 
                 predicates.add(cb.and(
                     cb.isNotNull(root.get("latitude")),
                     cb.isNotNull(root.get("longitude")),
                     cb.between(root.get("latitude"), 
-                        request.locationLatitude() - radiusInDegrees,
-                        request.locationLatitude() + radiusInDegrees),
+                        lat - radiusInDegrees,
+                        lat + radiusInDegrees),
                     cb.between(root.get("longitude"),
-                        request.locationLongitude() - radiusInDegrees,
-                        request.locationLongitude() + radiusInDegrees)
+                        lon - radiusInDegrees,
+                        lon + radiusInDegrees)
                 ));
             } else if (request.location() != null && !request.location().trim().isEmpty()) {
-                // 장소명이 제공된 경우 TMap API로 좌표 변환 시도
-                TmapApiService.TmapPlaceResult placeResult = tmapApiService.searchPlace(request.location().trim());
-                if (placeResult != null) {
-                    // 좌표 변환 성공 시 좌표 기반 필터링
-                    double radiusInDegrees = request.locationRadius() / 111000.0;
-                    predicates.add(cb.and(
-                        cb.isNotNull(root.get("latitude")),
-                        cb.isNotNull(root.get("longitude")),
-                        cb.between(root.get("latitude"),
-                            placeResult.getLatitude() - radiusInDegrees,
-                            placeResult.getLatitude() + radiusInDegrees),
-                        cb.between(root.get("longitude"),
-                            placeResult.getLongitude() - radiusInDegrees,
-                            placeResult.getLongitude() + radiusInDegrees)
-                    ));
-                    log.info("장소명 '{}'을 좌표 ({}, {})로 변환하여 반경 {}m 내 필터링", 
-                            request.location(), placeResult.getLatitude(), placeResult.getLongitude(), request.locationRadius());
-                } else {
-                    // 좌표 변환 실패 시 기존 문자열 일치 방식으로 폴백
-                    log.warn("장소명 '{}'을 좌표로 변환할 수 없어 문자열 일치 방식으로 필터링", request.location());
-                    predicates.add(cb.like(
-                        cb.lower(root.get("location")),
-                        "%" + request.location().toLowerCase().trim() + "%"
-                    ));
-                }
+                // 좌표 변환이 실패했거나 좌표가 없는 경우 문자열 일치 방식으로 폴백
+                log.warn("장소명 '{}'에 대한 좌표가 없어 문자열 일치 방식으로 필터링", request.location());
+                predicates.add(cb.like(
+                    cb.lower(root.get("location")),
+                    "%" + request.location().toLowerCase().trim() + "%"
+                ));
             }
 
             // 브랜드 필터 (부분 일치)
@@ -377,6 +371,19 @@ public class LostItemService {
     public LostItemListDto searchLostItems(SearchLostItemRequest request) {
         log.info("Searching lost items with query: {}, filters: category={}, location={}, brand={}, foundDateAfter={}", 
                 request.query(), request.category(), request.location(), request.brand(), request.foundDateAfter());
+
+        // 장소 필터링을 위한 좌표 미리 변환 (중복 호출 방지)
+        TmapApiService.TmapPlaceResult locationPlaceResult = null;
+        if (request.location() != null && !request.location().trim().isEmpty()) {
+            locationPlaceResult = tmapApiService.searchPlace(request.location().trim());
+            if (locationPlaceResult != null) {
+                log.info("검색 필터: 장소명 '{}'을 좌표 ({}, {})로 변환", 
+                        request.location(), locationPlaceResult.getLatitude(), locationPlaceResult.getLongitude());
+            }
+        }
+        
+        // final 변수로 복사 (람다에서 사용하기 위해)
+        final TmapApiService.TmapPlaceResult finalLocationPlaceResult = locationPlaceResult;
 
         // 1. Flask AI 서버에 검색 요청 (필터를 고려하여 더 많이 가져옴)
         int searchTopK = request.topK();
@@ -409,7 +416,7 @@ public class LostItemService {
         List<LostItemDto> items = itemIds.stream()
                 .map(itemMap::get)
                 .filter(Objects::nonNull)
-                .filter(item -> !hasFilters(request) || matchesFilters(item, request))
+                .filter(item -> !hasFilters(request) || matchesFilters(item, request, finalLocationPlaceResult))
                 .map(LostItemDto::from)
                 .limit(request.topK()) // 최종 결과는 요청한 개수만큼만
                 .toList();
@@ -449,8 +456,12 @@ public class LostItemService {
     /**
      * 아이템이 필터 조건에 맞는지 확인
      * 장소 필터링은 좌표 기반 반경 필터링을 사용
+     * @param item 분실물 아이템
+     * @param request 검색 요청
+     * @param locationPlaceResult 미리 변환된 장소 좌표 (null이면 request.location()으로 변환 시도)
      */
-    private boolean matchesFilters(LostItem item, SearchLostItemRequest request) {
+    private boolean matchesFilters(LostItem item, SearchLostItemRequest request, 
+                                   TmapApiService.TmapPlaceResult locationPlaceResult) {
         // 카테고리 필터
         if (request.category() != null && !item.getCategory().equals(request.category())) {
             return false;
@@ -458,8 +469,14 @@ public class LostItemService {
 
         // 장소 필터 (좌표 기반 반경 필터링)
         if (request.location() != null && !request.location().trim().isEmpty()) {
-            // TMap API로 장소명을 좌표로 변환
-            TmapApiService.TmapPlaceResult placeResult = tmapApiService.searchPlace(request.location().trim());
+            // 이미 변환된 좌표가 있으면 사용, 없으면 변환 시도 (폴백)
+            TmapApiService.TmapPlaceResult placeResult = locationPlaceResult;
+            if (placeResult == null) {
+                // 폴백: 변환되지 않은 경우에만 호출 (일반적으로는 발생하지 않아야 함)
+                log.warn("matchesFilters에서 장소 좌표가 전달되지 않아 변환 시도: {}", request.location());
+                placeResult = tmapApiService.searchPlace(request.location().trim());
+            }
+            
             if (placeResult != null) {
                 // 좌표 기반 반경 필터링 (기본 반경 10km)
                 if (item.getLatitude() == null || item.getLongitude() == null) {

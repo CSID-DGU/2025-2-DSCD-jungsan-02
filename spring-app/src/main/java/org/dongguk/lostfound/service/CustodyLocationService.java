@@ -20,6 +20,13 @@ import java.util.stream.Collectors;
 public class CustodyLocationService {
     private final CustodyLocationRepository custodyLocationRepository;
     private final TmapApiService tmapApiService;
+    
+    /**
+     * TMap API 쿼터 초과 상태 확인
+     */
+    public boolean isTmapQuotaExceeded() {
+        return tmapApiService.isQuotaExceeded();
+    }
 
     /**
      * 모든 보관소 목록 조회 (드롭다운용)
@@ -173,10 +180,18 @@ public class CustodyLocationService {
         }
 
         // 도보 거리 기준으로 정렬하고 TopK 반환
-        return results.stream()
+        List<CustodyLocationDto> sortedResults = results.stream()
                 .sorted(Comparator.comparingInt(CustodyLocationDto::walkingDistance))
                 .limit(topK)
                 .collect(Collectors.toList());
+        
+        // 쿼터 초과가 발생했고 결과가 있으면 로그 남기기
+        if (quotaExceeded && !sortedResults.isEmpty()) {
+            log.warn("TMap API 쿼터 초과로 인해 일부 보관소만 반환됩니다. (반환된 개수: {}/{})", 
+                    sortedResults.size(), topK);
+        }
+        
+        return sortedResults;
     }
 
     /**
