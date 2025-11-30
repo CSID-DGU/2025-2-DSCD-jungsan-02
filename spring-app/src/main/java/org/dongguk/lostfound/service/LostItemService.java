@@ -49,6 +49,7 @@ public class LostItemService {
     private final FlaskApiService flaskApiService;
     private final UserRepository userRepository;
     private final LostItemRepository lostItemRepository;
+    private final TmapApiService tmapApiService;
 
     /**
      * 분실물 등록
@@ -179,11 +180,23 @@ public class LostItemService {
     }
 
     /**
-     * 장소별 필터링 조회
+     * 장소별 필터링 조회 (부분 일치)
      */
     public LostItemListDto getLostItemsByLocation(String location, int page, int size) {
         Pageable pageable = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "foundDate"));
-        Page<LostItem> itemPage = lostItemRepository.findByLocation(location, pageable);
+        
+        // 부분 일치를 위해 Specification 사용
+        Specification<LostItem> spec = (root, query, cb) -> {
+            if (location == null || location.trim().isEmpty()) {
+                return cb.conjunction(); // 항상 true
+            }
+            return cb.like(
+                cb.lower(root.get("location")),
+                "%" + location.toLowerCase().trim() + "%"
+            );
+        };
+        
+        Page<LostItem> itemPage = lostItemRepository.findAll(spec, pageable);
 
         List<LostItemDto> items = itemPage.getContent().stream()
                 .map(LostItemDto::from)
@@ -199,22 +212,80 @@ public class LostItemService {
 
     /**
      * 통합 필터링 조회 (카테고리, 장소, 날짜 범위를 동시에 적용)
+     * 장소 필터링은 좌표 기반 반경 필터링을 사용
      */
     public LostItemListDto filterLostItems(FilterLostItemRequest request) {
+        // 장소 필터링을 위한 좌표 준비
+        Double filterLat = request.locationLatitude();
+        Double filterLon = request.locationLongitude();
+        Double filterRadius = request.locationRadius();
+        
+        // 장소명만 제공된 경우 좌표로 변환
+        if ((filterLat == null || filterLon == null) && 
+            request.location() != null && !request.location().trim().isEmpty()) {
+            TmapApiService.TmapPlaceResult placeResult = tmapApiService.searchPlace(request.location().trim());
+            if (placeResult != null) {
+                filterLat = placeResult.getLatitude();
+                filterLon = placeResult.getLongitude();
+                log.info("장소명 '{}'을 좌표 ({}, {})로 변환하여 필터링", 
+                        request.location(), filterLat, filterLon);
+            }
+        }
+        
+        // final 변수로 복사 (람다에서 사용하기 위해)
+        final Double finalFilterLat = filterLat;
+        final Double finalFilterLon = filterLon;
+        final Double finalFilterRadius = filterRadius;
+        
         Specification<LostItem> spec = buildSpecification(request);
         Pageable pageable = PageRequest.of(request.page(), request.size(), Sort.by(Sort.Direction.DESC, "foundDate"));
         Page<LostItem> itemPage = lostItemRepository.findAll(spec, pageable);
 
-        List<LostItemDto> items = itemPage.getContent().stream()
+        // 좌표 기반 필터링이 있는 경우 정확한 거리 계산으로 재필터링
+        List<LostItem> filteredItems = itemPage.getContent();
+        if (finalFilterLat != null && finalFilterLon != null && finalFilterRadius != null) {
+            filteredItems = filteredItems.stream()
+                    .filter(item -> {
+                        if (item.getLatitude() == null || item.getLongitude() == null) {
+                            return false;
+                        }
+                        double distance = calculateHaversineDistance(
+                                finalFilterLat, finalFilterLon,
+                                item.getLatitude(), item.getLongitude()
+                        );
+                        return distance <= finalFilterRadius;
+                    })
+                    .toList();
+        }
+
+        List<LostItemDto> items = filteredItems.stream()
                 .map(LostItemDto::from)
                 .toList();
 
         return LostItemListDto.builder()
                 .items(items)
-                .totalCount((int) itemPage.getTotalElements())
+                .totalCount(items.size()) // 정확한 거리 필터링 후 개수
                 .page(request.page())
                 .size(request.size())
                 .build();
+    }
+    
+    /**
+     * 하버사인 공식을 사용한 두 좌표 간 직선 거리 계산 (미터)
+     */
+    private double calculateHaversineDistance(double lat1, double lon1, double lat2, double lon2) {
+        final int R = 6371000; // 지구 반경 (미터)
+
+        double dLat = Math.toRadians(lat2 - lat1);
+        double dLon = Math.toRadians(lon2 - lon1);
+
+        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+
+        double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+        return R * c;
     }
 
     /**
@@ -229,12 +300,54 @@ public class LostItemService {
                 predicates.add(cb.equal(root.get("category"), request.category()));
             }
 
-            // 장소 필터 (부분 일치)
-            if (request.location() != null && !request.location().trim().isEmpty()) {
-                predicates.add(cb.like(
-                    cb.lower(root.get("location")),
-                    "%" + request.location().toLowerCase().trim() + "%"
+            // 장소 필터 (좌표 기반 반경 필터링)
+            if (request.locationLatitude() != null && request.locationLongitude() != null) {
+                // 좌표 기반 반경 필터링
+                // 하버사인 공식으로 거리 계산하여 반경 내 아이템만 필터링
+                // MySQL에서는 직접 하버사인 공식을 사용할 수 없으므로,
+                // 애플리케이션 레벨에서 필터링하거나 대략적인 범위로 먼저 필터링
+                // 여기서는 대략적인 위도/경도 범위로 먼저 필터링하고, 
+                // 실제 거리는 애플리케이션 레벨에서 계산
+                
+                // 대략적인 반경 계산 (1도 ≈ 111km)
+                double radiusInDegrees = request.locationRadius() / 111000.0;
+                
+                predicates.add(cb.and(
+                    cb.isNotNull(root.get("latitude")),
+                    cb.isNotNull(root.get("longitude")),
+                    cb.between(root.get("latitude"), 
+                        request.locationLatitude() - radiusInDegrees,
+                        request.locationLatitude() + radiusInDegrees),
+                    cb.between(root.get("longitude"),
+                        request.locationLongitude() - radiusInDegrees,
+                        request.locationLongitude() + radiusInDegrees)
                 ));
+            } else if (request.location() != null && !request.location().trim().isEmpty()) {
+                // 장소명이 제공된 경우 TMap API로 좌표 변환 시도
+                TmapApiService.TmapPlaceResult placeResult = tmapApiService.searchPlace(request.location().trim());
+                if (placeResult != null) {
+                    // 좌표 변환 성공 시 좌표 기반 필터링
+                    double radiusInDegrees = request.locationRadius() / 111000.0;
+                    predicates.add(cb.and(
+                        cb.isNotNull(root.get("latitude")),
+                        cb.isNotNull(root.get("longitude")),
+                        cb.between(root.get("latitude"),
+                            placeResult.getLatitude() - radiusInDegrees,
+                            placeResult.getLatitude() + radiusInDegrees),
+                        cb.between(root.get("longitude"),
+                            placeResult.getLongitude() - radiusInDegrees,
+                            placeResult.getLongitude() + radiusInDegrees)
+                    ));
+                    log.info("장소명 '{}'을 좌표 ({}, {})로 변환하여 반경 {}m 내 필터링", 
+                            request.location(), placeResult.getLatitude(), placeResult.getLongitude(), request.locationRadius());
+                } else {
+                    // 좌표 변환 실패 시 기존 문자열 일치 방식으로 폴백
+                    log.warn("장소명 '{}'을 좌표로 변환할 수 없어 문자열 일치 방식으로 필터링", request.location());
+                    predicates.add(cb.like(
+                        cb.lower(root.get("location")),
+                        "%" + request.location().toLowerCase().trim() + "%"
+                    ));
+                }
             }
 
             // 브랜드 필터 (부분 일치)
@@ -335,6 +448,7 @@ public class LostItemService {
 
     /**
      * 아이템이 필터 조건에 맞는지 확인
+     * 장소 필터링은 좌표 기반 반경 필터링을 사용
      */
     private boolean matchesFilters(LostItem item, SearchLostItemRequest request) {
         // 카테고리 필터
@@ -342,11 +456,29 @@ public class LostItemService {
             return false;
         }
 
-        // 장소 필터 (부분 일치)
+        // 장소 필터 (좌표 기반 반경 필터링)
         if (request.location() != null && !request.location().trim().isEmpty()) {
-            String location = request.location().toLowerCase().trim();
-            if (item.getLocation() == null || !item.getLocation().toLowerCase().contains(location)) {
-                return false;
+            // TMap API로 장소명을 좌표로 변환
+            TmapApiService.TmapPlaceResult placeResult = tmapApiService.searchPlace(request.location().trim());
+            if (placeResult != null) {
+                // 좌표 기반 반경 필터링 (기본 반경 10km)
+                if (item.getLatitude() == null || item.getLongitude() == null) {
+                    return false;
+                }
+                double distance = calculateHaversineDistance(
+                        placeResult.getLatitude(), placeResult.getLongitude(),
+                        item.getLatitude(), item.getLongitude()
+                );
+                double radius = 10000.0; // 기본값 10km
+                if (distance > radius) {
+                    return false;
+                }
+            } else {
+                // 좌표 변환 실패 시 기존 문자열 일치 방식으로 폴백
+                String location = request.location().toLowerCase().trim();
+                if (item.getLocation() == null || !item.getLocation().toLowerCase().contains(location)) {
+                    return false;
+                }
             }
         }
 
