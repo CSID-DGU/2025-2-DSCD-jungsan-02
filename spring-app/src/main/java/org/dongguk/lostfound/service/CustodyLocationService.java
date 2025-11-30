@@ -125,6 +125,45 @@ public class CustodyLocationService {
     }
 
     /**
+     * 장소명을 기반으로 가까운 보관소 검색
+     * 1. TMap API로 장소명 -> 좌표 변환
+     * 2. 해당 좌표 기준 10km 반경 내 보관소 필터링
+     * 3. 도보 거리 계산 후 상위 5개 반환
+     * 
+     * @param placeName 장소명 (예: "강남역", "홍대입구역")
+     * @param topK 반환할 개수 (기본값 5)
+     * @return 가까운 보관소 목록
+     */
+    @Transactional(readOnly = true)
+    public List<CustodyLocationDto> findNearbyCustodyLocationsByPlaceName(String placeName, Integer topK) {
+        log.info("장소명 기반 보관소 검색 요청: placeName={}, topK={}", placeName, topK);
+        
+        // 1. TMap API로 장소명 -> 좌표 변환
+        TmapApiService.TmapPlaceResult placeResult = tmapApiService.searchPlace(placeName);
+        
+        if (placeResult == null) {
+            log.warn("장소명 '{}'에 대한 좌표를 찾을 수 없습니다.", placeName);
+            return new ArrayList<>();
+        }
+        
+        Double placeLat = placeResult.getLatitude();
+        Double placeLon = placeResult.getLongitude();
+        String foundPlaceName = placeResult.getName();
+        
+        log.info("장소 검색 성공: 입력='{}', 검색결과='{}', 좌표=({}, {})", 
+                placeName, foundPlaceName, placeLat, placeLon);
+        
+        // 2. 좌표 기반으로 가까운 보관소 검색 (기존 메서드 재사용)
+        NearbyCustodyLocationRequest request = new NearbyCustodyLocationRequest(
+                placeLat, 
+                placeLon, 
+                topK != null ? topK : 5
+        );
+        
+        return findNearbyCustodyLocations(request);
+    }
+
+    /**
      * 하버사인 공식을 사용한 두 좌표 간 직선 거리 계산 (미터)
      */
     private double calculateHaversineDistance(double lat1, double lon1, double lat2, double lon2) {

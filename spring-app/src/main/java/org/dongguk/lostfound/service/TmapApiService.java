@@ -141,6 +141,130 @@ public class TmapApiService {
     }
 
     /**
+     * TMap 장소 검색 API를 사용하여 장소명으로 좌표 검색
+     * 
+     * @param placeName 장소명 (예: "강남역", "홍대입구역")
+     * @return 좌표 정보 (위도, 경도), 실패 시 null
+     */
+    public TmapPlaceResult searchPlace(String placeName) {
+        try {
+            log.info("TMap 장소 검색 요청: placeName={}", placeName);
+
+            // TMap Search API 호출: GET /search/poi?version=1
+            var responseEntity = tmapRestClient.get()
+                    .uri(uriBuilder -> uriBuilder
+                            .path("/search/poi")
+                            .queryParam("version", "1")
+                            .queryParam("searchKeyword", placeName)
+                            .queryParam("searchType", "all")
+                            .queryParam("searchtypCd", "A")
+                            .queryParam("reqCoordType", "WGS84GEO")
+                            .queryParam("resCoordType", "WGS84GEO")
+                            .queryParam("count", "1")  // 첫 번째 결과만
+                            .build())
+                    .retrieve()
+                    .toEntity(Map.class);
+
+            // 상태 코드 확인
+            if (!responseEntity.getStatusCode().is2xxSuccessful()) {
+                log.warn("TMap 장소 검색 API 호출 실패: status={}, placeName={}", 
+                        responseEntity.getStatusCode(), placeName);
+                return null;
+            }
+
+            Map<String, Object> response = responseEntity.getBody();
+            if (response == null) {
+                log.warn("TMap 장소 검색 API 응답이 null입니다. placeName={}", placeName);
+                return null;
+            }
+
+            // 응답 파싱: searchPoiInfo.pois.poi[0].frontLat, frontLon
+            if (!response.containsKey("searchPoiInfo")) {
+                log.warn("TMap 장소 검색 API 응답에 'searchPoiInfo' 키가 없습니다. placeName={}", placeName);
+                return null;
+            }
+
+            Map<String, Object> searchPoiInfo = (Map<String, Object>) response.get("searchPoiInfo");
+            if (!searchPoiInfo.containsKey("pois")) {
+                log.warn("TMap 장소 검색 API 응답에 'pois' 키가 없습니다. placeName={}", placeName);
+                return null;
+            }
+
+            Map<String, Object> pois = (Map<String, Object>) searchPoiInfo.get("pois");
+            if (!pois.containsKey("poi")) {
+                log.warn("TMap 장소 검색 API 응답에 'poi' 키가 없습니다. placeName={}", placeName);
+                return null;
+            }
+
+            Object poiObj = pois.get("poi");
+            java.util.List<?> poiList = null;
+            
+            if (poiObj instanceof java.util.List) {
+                poiList = (java.util.List<?>) poiObj;
+            } else if (poiObj instanceof Map) {
+                // 단일 객체인 경우 리스트로 변환
+                poiList = java.util.List.of(poiObj);
+            }
+
+            if (poiList == null || poiList.isEmpty()) {
+                log.warn("TMap 장소 검색 결과가 없습니다. placeName={}", placeName);
+                return null;
+            }
+
+            Map<String, Object> firstPoi = (Map<String, Object>) poiList.get(0);
+            Object latObj = firstPoi.get("frontLat");
+            Object lonObj = firstPoi.get("frontLon");
+            Object nameObj = firstPoi.get("name");
+
+            if (latObj == null || lonObj == null) {
+                log.warn("TMap 장소 검색 결과에 좌표가 없습니다. placeName={}", placeName);
+                return null;
+            }
+
+            // 좌표 변환 (String 또는 Number일 수 있음)
+            Double latitude = null;
+            Double longitude = null;
+
+            if (latObj instanceof String) {
+                latitude = Double.parseDouble((String) latObj);
+            } else if (latObj instanceof Number) {
+                latitude = ((Number) latObj).doubleValue();
+            }
+
+            if (lonObj instanceof String) {
+                longitude = Double.parseDouble((String) lonObj);
+            } else if (lonObj instanceof Number) {
+                longitude = ((Number) lonObj).doubleValue();
+            }
+
+            if (latitude == null || longitude == null) {
+                log.warn("TMap 장소 검색 결과의 좌표를 변환할 수 없습니다. placeName={}", placeName);
+                return null;
+            }
+
+            String foundName = nameObj != null ? nameObj.toString() : placeName;
+
+            log.info("TMap 장소 검색 성공: placeName={}, foundName={}, lat={}, lon={}", 
+                    placeName, foundName, latitude, longitude);
+
+            return new TmapPlaceResult(foundName, latitude, longitude);
+
+        } catch (org.springframework.web.client.HttpClientErrorException e) {
+            if (e.getStatusCode().value() == 429) {
+                log.error("TMap 장소 검색 API 쿼터 초과 (429). placeName={}", placeName);
+            } else {
+                log.error("TMap 장소 검색 API 클라이언트 에러 ({}): {}. placeName={}", 
+                        e.getStatusCode(), e.getResponseBodyAsString(), placeName);
+            }
+            return null;
+        } catch (Exception e) {
+            log.error("TMap 장소 검색 API 호출 중 예외 발생. placeName={}, error: {}", 
+                    placeName, e.getMessage(), e);
+            return null;
+        }
+    }
+
+    /**
      * TMAP API 결과를 담는 내부 클래스
      */
     public static class TmapRouteResult {
@@ -158,6 +282,33 @@ public class TmapApiService {
 
         public Double getTime() {
             return time;
+        }
+    }
+
+    /**
+     * TMap 장소 검색 결과를 담는 내부 클래스
+     */
+    public static class TmapPlaceResult {
+        private final String name;
+        private final Double latitude;
+        private final Double longitude;
+
+        public TmapPlaceResult(String name, Double latitude, Double longitude) {
+            this.name = name;
+            this.latitude = latitude;
+            this.longitude = longitude;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public Double getLatitude() {
+            return latitude;
+        }
+
+        public Double getLongitude() {
+            return longitude;
         }
     }
 }

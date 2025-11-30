@@ -34,5 +34,18 @@ public class CustodyLocationController {
         List<CustodyLocationDto> result = custodyLocationService.findNearbyCustodyLocations(request);
         return ResponseEntity.ok(result);
     }
+
+    /**
+     * 장소명 기반 가까운 보관소 검색
+     * 예: GET /api/v1/custody-locations/nearby-by-place?placeName=강남역&topK=5
+     */
+    @GetMapping("/nearby-by-place")
+    public ResponseEntity<List<CustodyLocationDto>> findNearbyCustodyLocationsByPlaceName(
+            @RequestParam String placeName,
+            @RequestParam(required = false, defaultValue = "5") Integer topK
+    ) {
+        List<CustodyLocationDto> result = custodyLocationService.findNearbyCustodyLocationsByPlaceName(placeName, topK);
+        return ResponseEntity.ok(result);
+    }
 }
 
