@@ -12,6 +12,7 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class TmapApiService {
     private final RestClient tmapRestClient;
+    private volatile boolean quotaExceeded = false; // 쿼터 초과 플래그 (volatile로 동시성 보장)
 
     /**
      * TMAP 도보 경로 API를 사용하여 두 좌표 간의 도보 거리와 시간을 계산
@@ -22,7 +23,27 @@ public class TmapApiService {
      * @param endLon 도착지 경도
      * @return Map with "distance" (meters) and "time" (minutes), or null if failed
      */
+    /**
+     * 쿼터 초과 상태 확인
+     */
+    public boolean isQuotaExceeded() {
+        return quotaExceeded;
+    }
+    
+    /**
+     * 쿼터 초과 플래그 리셋 (필요시 사용)
+     */
+    public void resetQuotaExceeded() {
+        quotaExceeded = false;
+    }
+
     public TmapRouteResult getWalkingDistance(Double startLat, Double startLon, Double endLat, Double endLon) {
+        // 쿼터 초과 상태면 즉시 null 반환 (불필요한 호출 방지)
+        if (quotaExceeded) {
+            log.warn("TMap API 쿼터 초과 상태입니다. 호출을 건너뜁니다.");
+            return null;
+        }
+        
         try {
             // TMap API 요청 본문 구성 (노트북 코드와 동일한 형식)
             Map<String, Object> requestBody = Map.of(
@@ -42,12 +63,22 @@ public class TmapApiService {
                     .uri("/routes/pedestrian?version=1")
                     .body(requestBody)
                     .retrieve()
+                    .onStatus(status -> status.value() == 429, (request, response) -> {
+                        quotaExceeded = true; // 쿼터 초과 플래그 설정
+                        log.error("TMAP API 쿼터 초과 (429) 감지 (onStatus). 이후 호출은 건너뜁니다.");
+                    })
                     .toEntity(Map.class);
 
             // 상태 코드 확인
             if (!responseEntity.getStatusCode().is2xxSuccessful()) {
-                log.warn("TMAP API 호출 실패: status={}, start: ({}, {}), end: ({}, {})", 
-                        responseEntity.getStatusCode(), startLat, startLon, endLat, endLon);
+                if (responseEntity.getStatusCode().value() == 429) {
+                    quotaExceeded = true; // 쿼터 초과 플래그 설정
+                    log.error("TMAP API 쿼터 초과 (429) 감지. 이후 호출은 건너뜁니다. start: ({}, {}), end: ({}, {})", 
+                            startLat, startLon, endLat, endLon);
+                } else {
+                    log.warn("TMAP API 호출 실패: status={}, start: ({}, {}), end: ({}, {})", 
+                            responseEntity.getStatusCode(), startLat, startLon, endLat, endLon);
+                }
                 return null;
             }
 
@@ -126,8 +157,11 @@ public class TmapApiService {
         } catch (org.springframework.web.client.HttpClientErrorException e) {
             // 4xx 에러 (400, 401, 429 등)
             if (e.getStatusCode().value() == 429) {
-                log.error("TMAP API 쿼터 초과 (429). start: ({}, {}), end: ({}, {})", 
+                quotaExceeded = true; // 쿼터 초과 플래그 설정
+                log.error("TMAP API 쿼터 초과 (429) 감지. 이후 호출은 건너뜁니다. start: ({}, {}), end: ({}, {})", 
                         startLat, startLon, endLat, endLon);
+                // 429 에러는 즉시 반환 (더 이상 호출하지 않음)
+                return null;
             } else {
                 log.error("TMAP API 클라이언트 에러 ({}): {}. start: ({}, {}), end: ({}, {})", 
                         e.getStatusCode(), e.getResponseBodyAsString(), startLat, startLon, endLat, endLon);
@@ -147,6 +181,12 @@ public class TmapApiService {
      * @return 좌표 정보 (위도, 경도), 실패 시 null
      */
     public TmapPlaceResult searchPlace(String placeName) {
+        // 쿼터 초과 상태면 즉시 null 반환
+        if (quotaExceeded) {
+            log.warn("TMap API 쿼터 초과 상태입니다. 장소 검색을 건너뜁니다.");
+            return null;
+        }
+        
         try {
             log.info("TMap 장소 검색 요청: placeName={}", placeName);
 
@@ -163,6 +203,14 @@ public class TmapApiService {
                             .queryParam("count", "1")  // 첫 번째 결과만
                             .build())
                     .retrieve()
+                    .onStatus(status -> status.value() == 429, (request, response) -> {
+                        quotaExceeded = true; // 쿼터 초과 플래그 설정
+                        log.error("TMap 장소 검색 API 쿼터 초과 (429) 감지. 이후 호출은 건너뜁니다.");
+                        throw new org.springframework.web.client.HttpClientErrorException(
+                                org.springframework.http.HttpStatus.TOO_MANY_REQUESTS,
+                                "TMap API 쿼터 초과"
+                        );
+                    })
                     .toEntity(Map.class);
 
             // 상태 코드 확인
@@ -251,7 +299,8 @@ public class TmapApiService {
 
         } catch (org.springframework.web.client.HttpClientErrorException e) {
             if (e.getStatusCode().value() == 429) {
-                log.error("TMap 장소 검색 API 쿼터 초과 (429). placeName={}", placeName);
+                quotaExceeded = true; // 쿼터 초과 플래그 설정
+                log.error("TMap 장소 검색 API 쿼터 초과 (429) 감지. 이후 호출은 건너뜁니다. placeName={}", placeName);
             } else {
                 log.error("TMap 장소 검색 API 클라이언트 에러 ({}): {}. placeName={}", 
                         e.getStatusCode(), e.getResponseBodyAsString(), placeName);

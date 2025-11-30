@@ -98,6 +98,7 @@ public class LostItemService {
         try {
             flaskApiService.createEmbedding(
                     lostItem.getId(),
+                    request.itemName(),  // 분실물 제목 추가
                     request.description(),
                     request.image()
             );

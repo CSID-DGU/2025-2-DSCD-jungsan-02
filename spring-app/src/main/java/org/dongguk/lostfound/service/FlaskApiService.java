@@ -36,10 +36,11 @@ public class FlaskApiService {
     /**
      * Flask AI 서버에 임베딩 생성 요청
      */
-    public void createEmbedding(Long itemId, String description, MultipartFile image) {
+    public void createEmbedding(Long itemId, String itemName, String description, MultipartFile image) {
         try {
             MultipartBodyBuilder builder = new MultipartBodyBuilder();
             builder.part("item_id", itemId.toString());
+            builder.part("item_name", itemName != null ? itemName : "");  // 분실물 제목 추가
             builder.part("description", description != null ? description : "");
             
             if (image != null && !image.isEmpty()) {
@@ -122,10 +123,10 @@ public class FlaskApiService {
      * Flask AI 서버에 임베딩 생성 요청 (이미지 URL 사용)
      * CSV 임포트된 데이터의 이미지 URL에서 이미지를 다운로드하여 임베딩 생성
      */
-    public void createEmbeddingFromUrl(Long itemId, String description, String imageUrl) {
+    public void createEmbeddingFromUrl(Long itemId, String itemName, String description, String imageUrl) {
         if (imageUrl == null || imageUrl.isEmpty()) {
             // 이미지가 없으면 텍스트만으로 임베딩 생성
-            createEmbedding(itemId, description, null);
+            createEmbedding(itemId, itemName, description, null);
             return;
         }
         
@@ -149,7 +150,7 @@ public class FlaskApiService {
                 log.warn("이미지 파일이 너무 큽니다 ({}MB). 스킵합니다: {}", 
                     imageBytes.length / (1024 * 1024), imageUrl);
                 // 텍스트만으로 임베딩 생성
-                createEmbedding(itemId, description, null);
+                createEmbedding(itemId, itemName, description, null);
                 return;
             }
             
@@ -208,13 +209,13 @@ public class FlaskApiService {
             };
             
             // 기존 메서드 호출
-            createEmbedding(itemId, description, imageFile);
+            createEmbedding(itemId, itemName, description, imageFile);
             
         } catch (Exception e) {
             log.error("이미지 URL에서 이미지 다운로드 실패: {}", imageUrl, e);
             // 이미지 다운로드 실패 시 텍스트만으로 임베딩 생성 시도
             try {
-                createEmbedding(itemId, description, null);
+                createEmbedding(itemId, itemName, description, null);
             } catch (Exception ex) {
                 log.warn("텍스트만으로 임베딩 생성도 실패: itemId={}", itemId, ex);
             }
@@ -236,6 +237,7 @@ public class FlaskApiService {
             for (LostItem item : items) {
                 Map<String, Object> itemData = new HashMap<>();
                 itemData.put("item_id", item.getId());
+                itemData.put("item_name", item.getItemName() != null ? item.getItemName() : "");  // 분실물 제목 추가
                 itemData.put("description", item.getDescription() != null ? item.getDescription() : "");
                 itemData.put("image_url", item.getImageUrl() != null ? item.getImageUrl() : "");
                 itemsData.add(itemData);

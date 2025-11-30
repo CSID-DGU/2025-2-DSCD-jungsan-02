@@ -75,13 +75,61 @@ public class CustodyLocationService {
         }
 
         // 2차: 각 보관소까지의 도보 거리 계산 (TMap API 사용)
-        List<CustodyLocationDto> results = new ArrayList<>();
+        // 최대 처리 개수 제한 (너무 많으면 시간이 오래 걸림)
+        int maxProcessCount = Math.min(nearbyLocations.size(), 20); // 최대 20개만 처리
+        List<CustodyLocation> locationsToProcess = nearbyLocations.subList(0, maxProcessCount);
         
-        for (CustodyLocation location : nearbyLocations) {
-            TmapApiService.TmapRouteResult routeResult = tmapApiService.getWalkingDistance(
-                    userLat, userLon,
-                    location.getLatitude(), location.getLongitude()
-            );
+        if (nearbyLocations.size() > maxProcessCount) {
+            log.info("보관소가 많아서 {}개만 처리합니다. (전체: {}개)", maxProcessCount, nearbyLocations.size());
+        }
+        
+        List<CustodyLocationDto> results = new ArrayList<>();
+        int processedCount = 0;
+        boolean quotaExceeded = false; // 쿼터 초과 플래그
+        
+        for (CustodyLocation location : locationsToProcess) {
+            // 쿼터 초과가 발생했으면 더 이상 호출하지 않음
+            if (quotaExceeded) {
+                log.warn("TMap API 쿼터 초과로 인해 나머지 보관소는 직선 거리로 계산합니다.");
+                // 나머지는 직선 거리로 계산
+                double straightDistance = calculateHaversineDistance(
+                        userLat, userLon,
+                        location.getLatitude(), location.getLongitude()
+                );
+                int estimatedWalkingDistance = (int) (straightDistance * 1.3);
+                double estimatedWalkingTime = estimatedWalkingDistance / 70.0;
+                
+                CustodyLocationDto dto = CustodyLocationDto.from(
+                        location,
+                        estimatedWalkingDistance,
+                        estimatedWalkingTime
+                );
+                results.add(dto);
+                continue;
+            }
+            
+            processedCount++;
+            log.debug("보관소 거리 계산 중: {}/{} - {}", processedCount, locationsToProcess.size(), location.getName());
+            
+            // API 호출 전에 쿼터 초과 상태 확인
+            if (tmapApiService.isQuotaExceeded()) {
+                quotaExceeded = true;
+                log.warn("TMap API 쿼터 초과 상태입니다. 나머지 보관소는 직선 거리로 계산합니다.");
+            }
+            
+            TmapApiService.TmapRouteResult routeResult = null;
+            if (!quotaExceeded) {
+                routeResult = tmapApiService.getWalkingDistance(
+                        userLat, userLon,
+                        location.getLatitude(), location.getLongitude()
+                );
+                
+                // 호출 후 쿼터 초과 상태 확인
+                if (tmapApiService.isQuotaExceeded()) {
+                    quotaExceeded = true;
+                    log.error("TMap API 쿼터 초과 감지. 나머지 보관소는 직선 거리로 계산합니다.");
+                }
+            }
 
             if (routeResult != null) {
                 CustodyLocationDto dto = CustodyLocationDto.from(
@@ -106,6 +154,13 @@ public class CustodyLocationService {
                         estimatedWalkingTime
                 );
                 results.add(dto);
+            }
+
+            // 쿼터 초과가 발생했으면 즉시 루프 중단
+            if (quotaExceeded) {
+                log.warn("TMap API 쿼터 초과로 인해 보관소 거리 계산을 중단합니다. (처리된 개수: {}/{})", 
+                        processedCount, locationsToProcess.size());
+                break; // 루프 즉시 중단
             }
 
             // API 호출 제한 방지를 위한 딜레이 (0.5초)

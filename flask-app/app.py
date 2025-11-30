@@ -240,6 +240,7 @@ def create_embedding():
     
     Spring에서 받는 것:
     - item_id: MySQL 분실물 ID (필수)
+    - item_name: 분실물 제목 (필수) - 예: "분홍색 지갑", "검은색 가방"
     - description: 사용자가 입력한 분실물 설명 (선택)
     - image: 분실물 이미지 파일 (선택)
     
@@ -250,6 +251,7 @@ def create_embedding():
     """
     try:
         item_id = request.form.get('item_id')
+        item_name = request.form.get('item_name', '')  # 분실물 제목 추가
         raw_description = request.form.get('description', '')
         image_file = request.files.get('image')
         
@@ -269,9 +271,12 @@ def create_embedding():
                 image_description = raw_description.strip()
             print(f"🖼️  이미지 분석 완료 (원본): {image_description[:100]}...")
         
-        # 2. 이미지 묘사 + 사용자 설명 결합 (원본 텍스트로 결합)
-        #    예) "빨간색 가죽 지갑입니다. 신촌역 3번 출구에서 발견했습니다."
+        # 2. 분실물 제목 + 이미지 묘사 + 사용자 설명 결합 (원본 텍스트로 결합)
+        #    예) "분홍색 지갑. 빨간색 가죽 지갑입니다. 신촌역 3번 출구에서 발견했습니다."
         parts = []
+        # 분실물 제목을 가장 먼저 추가 (검색 시 가장 중요)
+        if item_name and item_name.strip():
+            parts.append(item_name.strip())
         if image_description:
             parts.append(image_description)
         if raw_description and raw_description.strip():
@@ -330,6 +335,7 @@ def create_embeddings_batch():
     Spring에서 받는 것:
     - items: 아이템 리스트 (각 아이템은 다음 필드 포함)
       - item_id: MySQL 분실물 ID (필수)
+      - item_name: 분실물 제목 (필수) - 예: "분홍색 지갑"
       - description: 사용자가 입력한 분실물 설명 (선택)
       - image_url: 이미지 URL (선택)
       - image: 이미지 파일 (image_url이 없을 경우, 선택)
@@ -366,6 +372,7 @@ def create_embeddings_batch():
         def process_item(item):
             """단일 아이템 처리"""
             item_id = item.get('item_id')
+            item_name = item.get('item_name', '')  # 분실물 제목 추가
             raw_description = item.get('description', '')
             image_url = item.get('image_url', '')
             
@@ -404,8 +411,11 @@ def create_embeddings_batch():
                                 time.sleep(0.5 * (attempt + 1))  # 지수 백오프
                             # 마지막 시도 실패 시 텍스트로 진행
                 
-                # 2. 텍스트 결합 및 전처리
+                # 2. 분실물 제목 + 이미지 묘사 + 사용자 설명 결합
                 parts = []
+                # 분실물 제목을 가장 먼저 추가 (검색 시 가장 중요)
+                if item_name and item_name.strip():
+                    parts.append(item_name.strip())
                 if image_description:
                     parts.append(image_description)
                 if raw_description and raw_description.strip():

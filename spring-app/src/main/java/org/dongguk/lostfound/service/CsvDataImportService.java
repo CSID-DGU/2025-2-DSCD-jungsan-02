@@ -388,9 +388,10 @@ public class CsvDataImportService {
                     for (LostItem item : batch) {
                         try {
                             flaskApiService.createEmbeddingFromUrl(
-                                item.getId(),
-                                item.getDescription(),
-                                item.getImageUrl()
+                                    item.getId(),
+                                    item.getItemName(),  // 분실물 제목 추가
+                                    item.getDescription(),
+                                    item.getImageUrl()
                             );
                         } catch (Exception ex) {
                             log.warn("임베딩 생성 실패 (나중에 재시도 가능): itemId={}", item.getId(), ex);
