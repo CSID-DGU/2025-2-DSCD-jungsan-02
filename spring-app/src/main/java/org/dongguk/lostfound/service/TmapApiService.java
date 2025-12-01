@@ -203,6 +203,14 @@ public class TmapApiService {
                             .queryParam("count", "1")  // 첫 번째 결과만
                             .build())
                     .retrieve()
+                    .onStatus(status -> status.value() == 403, (request, response) -> {
+                        log.error("TMap 장소 검색 API 인증 실패 (403). 응답 본문: {}", 
+                                response.getBody() != null ? response.getBody().toString() : "null");
+                        throw new org.springframework.web.client.HttpClientErrorException(
+                                org.springframework.http.HttpStatus.FORBIDDEN,
+                                "TMap API 인증 실패"
+                        );
+                    })
                     .onStatus(status -> status.value() == 429, (request, response) -> {
                         quotaExceeded = true; // 쿼터 초과 플래그 설정
                         log.error("TMap 장소 검색 API 쿼터 초과 (429) 감지. 이후 호출은 건너뜁니다.");
@@ -298,7 +306,11 @@ public class TmapApiService {
             return new TmapPlaceResult(foundName, latitude, longitude);
 
         } catch (org.springframework.web.client.HttpClientErrorException e) {
-            if (e.getStatusCode().value() == 429) {
+            if (e.getStatusCode().value() == 403) {
+                log.error("TMap 장소 검색 API 인증 실패 (403 FORBIDDEN). placeName={}", placeName);
+                log.error("응답 본문: {}", e.getResponseBodyAsString());
+                log.error("⚠️ TMap API 키가 올바르게 설정되었는지 확인하세요. application.yml의 tmap.api.key 속성을 확인하세요.");
+            } else if (e.getStatusCode().value() == 429) {
                 quotaExceeded = true; // 쿼터 초과 플래그 설정
                 log.error("TMap 장소 검색 API 쿼터 초과 (429) 감지. 이후 호출은 건너뜁니다. placeName={}", placeName);
             } else {
