@@ -12,6 +12,7 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class TmapApiService {
     private final RestClient tmapRestClient;
+    private final String tmapApiKey; // API 키 주입
     private volatile boolean quotaExceeded = false; // 쿼터 초과 플래그 (volatile로 동시성 보장)
 
     /**
@@ -190,43 +191,38 @@ public class TmapApiService {
         try {
             log.info("TMap 장소 검색 요청: placeName={}", placeName);
 
-            // TMap Search API 호출: GET /search/poi?version=1
-            // GET 요청에는 Content-Type 헤더가 필요 없으므로 제거
+            // TMap Search API 호출: GET /pois (공식 문서: https://tmap-skopenapi.readme.io/reference/장소통합검색)
             var responseEntity = tmapRestClient.get()
                     .uri(uriBuilder -> uriBuilder
-                            .path("/search/poi")
+                            .path("/pois")  // 공식 엔드포인트: /tmap/pois
                             .queryParam("version", "1")
                             .queryParam("searchKeyword", placeName)
                             .queryParam("searchType", "all")
                             .queryParam("searchtypCd", "A")
                             .queryParam("reqCoordType", "WGS84GEO")
                             .queryParam("resCoordType", "WGS84GEO")
+                            .queryParam("page", "1")
                             .queryParam("count", "1")  // 첫 번째 결과만
+                            .queryParam("multiPoint", "N")
+                            .queryParam("poiGroupYn", "N")
                             .build())
                     .headers(headers -> {
                         // GET 요청에서는 Content-Type 제거
                         headers.remove("Content-Type");
+                        // 공식 문서 예제에 따라 Accept 헤더 추가
+                        headers.set("Accept", "application/json");
                         // 요청 헤더 로깅 (디버깅용)
                         log.debug("TMap API 요청 헤더: {}", headers);
                     })
                     .retrieve()
                     .onStatus(status -> status.value() == 403, (request, response) -> {
-                        // 응답 본문 읽기
-                        String responseBody = "읽기 실패";
-                        try {
-                            if (response.getBody() != null) {
-                                java.io.InputStream inputStream = response.getBody();
-                                responseBody = new String(inputStream.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                            }
-                        } catch (Exception ex) {
-                            log.warn("응답 본문 읽기 실패: {}", ex.getMessage());
-                        }
-                        log.error("TMap 장소 검색 API 인증 실패 (403). 응답 본문: {}", responseBody);
+                        log.error("TMap 장소 검색 API 인증 실패 (403)");
                         log.error("요청 URL: {}", request.getURI());
                         log.error("요청 헤더: {}", request.getHeaders());
+                        // 응답 본문은 catch 블록에서 읽음
                         throw new org.springframework.web.client.HttpClientErrorException(
                                 org.springframework.http.HttpStatus.FORBIDDEN,
-                                "TMap API 인증 실패: " + responseBody
+                                "TMap API 인증 실패"
                         );
                     })
                     .onStatus(status -> status.value() == 429, (request, response) -> {
@@ -252,21 +248,26 @@ public class TmapApiService {
                 return null;
             }
 
+            log.debug("TMap 장소 검색 API 응답: {}", response);
+
             // 응답 파싱: searchPoiInfo.pois.poi[0].frontLat, frontLon
             if (!response.containsKey("searchPoiInfo")) {
-                log.warn("TMap 장소 검색 API 응답에 'searchPoiInfo' 키가 없습니다. placeName={}", placeName);
+                log.warn("TMap 장소 검색 API 응답에 'searchPoiInfo' 키가 없습니다. 응답 키: {}, placeName={}", 
+                        response.keySet(), placeName);
                 return null;
             }
 
             Map<String, Object> searchPoiInfo = (Map<String, Object>) response.get("searchPoiInfo");
             if (!searchPoiInfo.containsKey("pois")) {
-                log.warn("TMap 장소 검색 API 응답에 'pois' 키가 없습니다. placeName={}", placeName);
+                log.warn("TMap 장소 검색 API 응답에 'pois' 키가 없습니다. searchPoiInfo 키: {}, placeName={}", 
+                        searchPoiInfo.keySet(), placeName);
                 return null;
             }
 
             Map<String, Object> pois = (Map<String, Object>) searchPoiInfo.get("pois");
             if (!pois.containsKey("poi")) {
-                log.warn("TMap 장소 검색 API 응답에 'poi' 키가 없습니다. placeName={}", placeName);
+                log.warn("TMap 장소 검색 API 응답에 'poi' 키가 없습니다. pois 키: {}, placeName={}", 
+                        pois.keySet(), placeName);
                 return null;
             }
 
@@ -275,9 +276,15 @@ public class TmapApiService {
             
             if (poiObj instanceof java.util.List) {
                 poiList = (java.util.List<?>) poiObj;
+                log.debug("POI가 리스트 형태입니다. 개수: {}", poiList.size());
             } else if (poiObj instanceof Map) {
                 // 단일 객체인 경우 리스트로 변환
                 poiList = java.util.List.of(poiObj);
+                log.debug("POI가 단일 객체입니다.");
+            } else {
+                log.warn("POI 객체 타입을 알 수 없습니다. 타입: {}, placeName={}", 
+                        poiObj != null ? poiObj.getClass() : "null", placeName);
+                return null;
             }
 
             if (poiList == null || poiList.isEmpty()) {
@@ -286,12 +293,20 @@ public class TmapApiService {
             }
 
             Map<String, Object> firstPoi = (Map<String, Object>) poiList.get(0);
+            log.debug("첫 번째 POI 데이터: {}", firstPoi);
+            
             Object latObj = firstPoi.get("frontLat");
             Object lonObj = firstPoi.get("frontLon");
             Object nameObj = firstPoi.get("name");
 
+            log.debug("좌표 원본 데이터: frontLat={} (타입: {}), frontLon={} (타입: {}), name={}", 
+                    latObj, latObj != null ? latObj.getClass() : "null",
+                    lonObj, lonObj != null ? lonObj.getClass() : "null",
+                    nameObj);
+
             if (latObj == null || lonObj == null) {
-                log.warn("TMap 장소 검색 결과에 좌표가 없습니다. placeName={}", placeName);
+                log.warn("TMap 장소 검색 결과에 좌표가 없습니다. frontLat={}, frontLon={}, placeName={}", 
+                        latObj, lonObj, placeName);
                 return null;
             }
 
@@ -299,20 +314,31 @@ public class TmapApiService {
             Double latitude = null;
             Double longitude = null;
 
-            if (latObj instanceof String) {
-                latitude = Double.parseDouble((String) latObj);
-            } else if (latObj instanceof Number) {
-                latitude = ((Number) latObj).doubleValue();
-            }
+            try {
+                if (latObj instanceof String) {
+                    latitude = Double.parseDouble((String) latObj);
+                } else if (latObj instanceof Number) {
+                    latitude = ((Number) latObj).doubleValue();
+                } else {
+                    log.warn("위도를 파싱할 수 없습니다. 타입: {}, 값: {}", latObj.getClass(), latObj);
+                }
 
-            if (lonObj instanceof String) {
-                longitude = Double.parseDouble((String) lonObj);
-            } else if (lonObj instanceof Number) {
-                longitude = ((Number) lonObj).doubleValue();
+                if (lonObj instanceof String) {
+                    longitude = Double.parseDouble((String) lonObj);
+                } else if (lonObj instanceof Number) {
+                    longitude = ((Number) lonObj).doubleValue();
+                } else {
+                    log.warn("경도를 파싱할 수 없습니다. 타입: {}, 값: {}", lonObj.getClass(), lonObj);
+                }
+            } catch (NumberFormatException e) {
+                log.error("좌표 파싱 실패: latObj={}, lonObj={}, placeName={}, error={}", 
+                        latObj, lonObj, placeName, e.getMessage());
+                return null;
             }
 
             if (latitude == null || longitude == null) {
-                log.warn("TMap 장소 검색 결과의 좌표를 변환할 수 없습니다. placeName={}", placeName);
+                log.warn("TMap 장소 검색 결과의 좌표를 변환할 수 없습니다. latitude={}, longitude={}, placeName={}", 
+                        latitude, longitude, placeName);
                 return null;
             }
 
@@ -325,9 +351,13 @@ public class TmapApiService {
 
         } catch (org.springframework.web.client.HttpClientErrorException e) {
             if (e.getStatusCode().value() == 403) {
+                String responseBody = e.getResponseBodyAsString();
                 log.error("TMap 장소 검색 API 인증 실패 (403 FORBIDDEN). placeName={}", placeName);
-                log.error("응답 본문: {}", e.getResponseBodyAsString());
-                log.error("⚠️ TMap API 키가 올바르게 설정되었는지 확인하세요. application.yml의 tmap.api.key 속성을 확인하세요.");
+                log.error("응답 본문: {}", responseBody != null && !responseBody.isEmpty() ? responseBody : "(비어있음)");
+                log.error("응답 상태: {}", e.getStatusCode());
+                log.error("⚠️ TMap API 키가 올바르게 설정되었는지 확인하세요.");
+                log.error("⚠️ TMap 개발자 포털에서 API 키가 활성화되어 있고 '장소 검색 API' 권한이 있는지 확인하세요.");
+                log.error("⚠️ API 키는 application-prod.yml의 tmap.api.key 속성에서 확인할 수 있습니다.");
             } else if (e.getStatusCode().value() == 429) {
                 quotaExceeded = true; // 쿼터 초과 플래그 설정
                 log.error("TMap 장소 검색 API 쿼터 초과 (429) 감지. 이후 호출은 건너뜁니다. placeName={}", placeName);

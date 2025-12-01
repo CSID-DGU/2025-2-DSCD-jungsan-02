@@ -227,8 +227,24 @@ public class LostItemService {
             if (placeResult != null) {
                 filterLat = placeResult.getLatitude();
                 filterLon = placeResult.getLongitude();
-                log.info("장소명 '{}'을 좌표 ({}, {})로 변환하여 필터링", 
-                        request.location(), filterLat, filterLon);
+                // 반경이 지정되지 않았으면 기본 반경 10km 사용
+                if (filterRadius == null) {
+                    filterRadius = 10000.0; // 10km
+                    log.info("장소명 '{}'을 좌표 ({}, {})로 변환하여 필터링 (기본 반경: 10km)", 
+                            request.location(), filterLat, filterLon);
+                } else {
+                    log.info("장소명 '{}'을 좌표 ({}, {})로 변환하여 필터링 (반경: {}m)", 
+                            request.location(), filterLat, filterLon, filterRadius);
+                }
+            } else {
+                // TMap API 쿼터 초과 여부 확인
+                if (tmapApiService.isQuotaExceeded()) {
+                    log.error("⚠️ TMap API 쿼터 초과로 인해 장소명 '{}'의 좌표 변환이 실패했습니다. 문자열 일치 방식으로 필터링합니다.", 
+                            request.location());
+                } else {
+                    log.warn("⚠️ 장소명 '{}'에 대한 좌표를 찾을 수 없습니다. 문자열 일치 방식으로 필터링합니다.", 
+                            request.location());
+                }
             }
         }
         
@@ -239,13 +255,15 @@ public class LostItemService {
         
         // buildSpecification에 이미 변환된 좌표를 전달하여 중복 호출 방지
         Specification<LostItem> spec = buildSpecification(request, finalFilterLat, finalFilterLon, finalFilterRadius);
-        Pageable pageable = PageRequest.of(request.page(), request.size(), Sort.by(Sort.Direction.DESC, "foundDate"));
-        Page<LostItem> itemPage = lostItemRepository.findAll(spec, pageable);
-
-        // 좌표 기반 필터링이 있는 경우 정확한 거리 계산으로 재필터링
-        List<LostItem> filteredItems = itemPage.getContent();
+        
+        // 페이징 전에 전체 데이터를 가져와서 필터링 (일관성 유지)
+        // 좌표 기반 필터링이 있는 경우 정확한 거리 계산을 위해, 없는 경우에도 일관성을 위해 전체 데이터 처리
+        List<LostItem> allCandidates = lostItemRepository.findAll(spec);
+        
+        // 좌표 기반 필터링이 있는 경우: 정확한 거리 계산으로 재필터링
+        List<LostItem> filteredItems;
         if (finalFilterLat != null && finalFilterLon != null && finalFilterRadius != null) {
-            filteredItems = filteredItems.stream()
+            filteredItems = allCandidates.stream()
                     .filter(item -> {
                         if (item.getLatitude() == null || item.getLongitude() == null) {
                             return false;
@@ -256,18 +274,35 @@ public class LostItemService {
                         );
                         return distance <= finalFilterRadius;
                     })
+                    .sorted((a, b) -> b.getFoundDate().compareTo(a.getFoundDate())) // 최신순 정렬
+                    .toList();
+        } else {
+            // 좌표 기반 필터링이 없는 경우: 이미 buildSpecification에서 필터링 완료, 정렬만 적용
+            filteredItems = allCandidates.stream()
+                    .sorted((a, b) -> b.getFoundDate().compareTo(a.getFoundDate())) // 최신순 정렬
                     .toList();
         }
-
-        List<LostItemDto> items = filteredItems.stream()
+        
+        // 필터링 후 전체 개수
+        int totalCount = filteredItems.size();
+        
+        // 메모리에서 페이징 적용
+        int page = request.page();
+        int size = request.size();
+        int start = page * size;
+        int end = Math.min(start + size, totalCount);
+        
+        List<LostItem> pagedItems = start < totalCount ? filteredItems.subList(start, end) : List.of();
+        
+        List<LostItemDto> items = pagedItems.stream()
                 .map(LostItemDto::from)
                 .toList();
 
         return LostItemListDto.builder()
                 .items(items)
-                .totalCount(items.size()) // 정확한 거리 필터링 후 개수
-                .page(request.page())
-                .size(request.size())
+                .totalCount(totalCount) // 필터링 후 전체 개수
+                .page(page)
+                .size(size)
                 .build();
     }
     
@@ -314,6 +349,13 @@ public class LostItemService {
             Double lon = filterLon != null ? filterLon : request.locationLongitude();
             Double radius = filterRadius != null ? filterRadius : request.locationRadius();
             
+            // 좌표는 있는데 반경이 없으면 기본 반경 10km 사용
+            if (lat != null && lon != null && radius == null && 
+                request.location() != null && !request.location().trim().isEmpty()) {
+                radius = 10000.0; // 10km
+                log.debug("반경이 지정되지 않아 기본 반경 10km 사용: 장소명={}", request.location());
+            }
+            
             if (lat != null && lon != null && radius != null) {
                 // 좌표 기반 반경 필터링
                 // 하버사인 공식으로 거리 계산하여 반경 내 아이템만 필터링
@@ -337,19 +379,59 @@ public class LostItemService {
                 ));
             } else if (request.location() != null && !request.location().trim().isEmpty()) {
                 // 좌표 변환이 실패했거나 좌표가 없는 경우 문자열 일치 방식으로 폴백
-                log.warn("장소명 '{}'에 대한 좌표가 없어 문자열 일치 방식으로 필터링", request.location());
-                predicates.add(cb.like(
-                    cb.lower(root.get("location")),
-                    "%" + request.location().toLowerCase().trim() + "%"
-                ));
+                // 더 넓은 범위로 검색하기 위해 키워드를 분리하여 검색
+                String locationKeyword = request.location().toLowerCase().trim();
+                log.warn("장소명 '{}'에 대한 좌표가 없어 문자열 일치 방식으로 필터링", locationKeyword);
+                
+                // 키워드가 '역', '구', '동' 등으로 끝나는 경우 이를 제거하고 더 넓게 검색
+                // 예: '강남역' -> '강남' 또는 '강남역' 모두 검색
+                String locationKeywordWithoutSuffix = locationKeyword;
+                if (locationKeyword.endsWith("역")) {
+                    locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                } else if (locationKeyword.endsWith("구")) {
+                    locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                } else if (locationKeyword.endsWith("동")) {
+                    locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                }
+                
+                // 원본 키워드와 접미사 제거한 키워드 모두 검색 (OR 조건)
+                if (!locationKeywordWithoutSuffix.equals(locationKeyword) && locationKeywordWithoutSuffix.length() > 0) {
+                    predicates.add(cb.or(
+                        cb.like(cb.lower(root.get("location")), "%" + locationKeyword + "%"),
+                        cb.like(cb.lower(root.get("location")), "%" + locationKeywordWithoutSuffix + "%")
+                    ));
+                } else {
+                    predicates.add(cb.like(
+                        cb.lower(root.get("location")),
+                        "%" + locationKeyword + "%"
+                    ));
+                }
             }
 
             // 브랜드 필터 (부분 일치)
+            // itemName, description, brand 필드 모두에서 검색
             if (request.brand() != null && !request.brand().trim().isEmpty()) {
-                predicates.add(cb.like(
-                    cb.lower(root.get("brand")),
-                    "%" + request.brand().toLowerCase().trim() + "%"
+                String brandKeyword = request.brand().toLowerCase().trim();
+                // JPA의 like는 특수문자 이스케이프 처리를 위해 이스케이프 문자를 명시
+                // '%'와 '_'를 리터럴로 사용하기 위해 이스케이프 문자 '!' 사용
+                char escapeChar = '!';
+                // 사용자 입력에 특수문자가 있으면 이스케이프 처리
+                String escapedKeyword = brandKeyword
+                    .replace("!", "!!")  // 이스케이프 문자 자체를 이스케이프
+                    .replace("%", "!%")  // %를 리터럴로
+                    .replace("_", "!_"); // _를 리터럴로
+                String pattern = "%" + escapedKeyword + "%";
+                
+                // itemName, description, brand 중 하나라도 매치되면 통과 (OR 조건)
+                predicates.add(cb.or(
+                    cb.like(cb.lower(root.get("itemName")), pattern, escapeChar),
+                    cb.like(cb.lower(root.get("description")), pattern, escapeChar),
+                    cb.and(
+                        cb.isNotNull(root.get("brand")),
+                        cb.like(cb.lower(root.get("brand")), pattern, escapeChar)
+                    )
                 ));
+                log.info("브랜드 필터 적용: '{}' -> itemName, description, brand 필드에서 검색", brandKeyword);
             }
 
             // 날짜 필터 (해당 날짜 이후)
@@ -386,17 +468,28 @@ public class LostItemService {
         final TmapApiService.TmapPlaceResult finalLocationPlaceResult = locationPlaceResult;
 
         // 1. Flask AI 서버에 검색 요청 (필터를 고려하여 더 많이 가져옴)
+        // 필터가 많을수록 더 많이 가져와서 필터링 후에도 충분한 결과를 얻을 수 있도록 함
         int searchTopK = request.topK();
-        if (hasFilters(request)) {
-            // 필터가 있으면 더 많이 가져와서 필터링 후 상위 결과 반환
-            searchTopK = request.topK() * 3;
+        int filterCount = 0;
+        if (request.category() != null) filterCount++;
+        if (request.location() != null && !request.location().trim().isEmpty()) filterCount++;
+        if (request.brand() != null && !request.brand().trim().isEmpty()) filterCount++;
+        if (request.foundDateAfter() != null) filterCount++;
+        
+        // 필터 개수에 따라 더 많이 가져옴 (필터가 많을수록 더 많이)
+        if (filterCount > 0) {
+            searchTopK = request.topK() * Math.max(3, filterCount * 2); // 최소 3배, 필터당 2배씩 증가
         }
+        
+        log.info("자연어 검색 요청: query={}, topK={} (필터 개수: {})", request.query(), searchTopK, filterCount);
+        
         List<Long> itemIds = flaskApiService.searchSimilarItems(
                 request.query(),
                 searchTopK
         );
 
         if (itemIds.isEmpty()) {
+            log.warn("Flask AI 서버에서 검색 결과가 없습니다. query={}", request.query());
             return LostItemListDto.builder()
                     .items(List.of())
                     .totalCount(0)
@@ -408,15 +501,46 @@ public class LostItemService {
         // 2. MySQL에서 해당 분실물들 조회
         List<LostItem> lostItems = lostItemRepository.findAllById(itemIds);
         
+        log.info("Flask AI에서 받은 itemIds: {}개, MySQL에서 조회된 아이템: {}개", itemIds.size(), lostItems.size());
+        
         // 3. Map으로 변환하여 O(1) 조회 성능 확보 (findAllById는 순서 보장 안 함)
         Map<Long, LostItem> itemMap = lostItems.stream()
                 .collect(Collectors.toMap(LostItem::getId, item -> item));
+        
+        // 조회되지 않은 itemIds 확인 (디버깅용)
+        List<Long> notFoundIds = itemIds.stream()
+                .filter(id -> !itemMap.containsKey(id))
+                .limit(10)
+                .toList();
+        if (!notFoundIds.isEmpty()) {
+            log.warn("MySQL에서 조회되지 않은 itemIds (상위 10개): {}", notFoundIds);
+        }
 
         // 4. FAISS에서 반환된 순서대로 아이템 조회 및 필터 적용
-        List<LostItemDto> items = itemIds.stream()
+        boolean hasFilters = hasFilters(request);
+        log.info("필터 적용 여부: {}, 필터 조건: category={}, location={}, brand={}, foundDateAfter={}", 
+                hasFilters, request.category(), request.location(), request.brand(), request.foundDateAfter());
+        
+        List<LostItem> filteredItems = itemIds.stream()
                 .map(itemMap::get)
                 .filter(Objects::nonNull)
-                .filter(item -> !hasFilters(request) || matchesFilters(item, request, finalLocationPlaceResult))
+                .filter(item -> {
+                    if (!hasFilters) {
+                        return true; // 필터가 없으면 모두 통과
+                    }
+                    boolean matches = matchesFilters(item, request, finalLocationPlaceResult);
+                    if (!matches) {
+                        log.debug("아이템 필터링 제외: itemId={}, itemName={}, category={}, brand={}, location={}", 
+                                item.getId(), item.getItemName(), item.getCategory(), item.getBrand(), item.getLocation());
+                    }
+                    return matches;
+                })
+                .toList();
+        
+        log.info("필터 적용 전: {}개, 필터 적용 후: {}개", itemIds.size(), filteredItems.size());
+        
+        // 필터링된 결과를 DTO로 변환 (FAISS 순서 유지)
+        List<LostItemDto> items = filteredItems.stream()
                 .map(LostItemDto::from)
                 .limit(request.topK()) // 최종 결과는 요청한 개수만큼만
                 .toList();
@@ -491,20 +615,62 @@ public class LostItemService {
                     return false;
                 }
             } else {
-                // 좌표 변환 실패 시 기존 문자열 일치 방식으로 폴백
-                String location = request.location().toLowerCase().trim();
-                if (item.getLocation() == null || !item.getLocation().toLowerCase().contains(location)) {
+                // 좌표 변환 실패 시 문자열 일치 방식으로 폴백 (filterLostItems와 동일한 로직)
+                String locationKeyword = request.location().toLowerCase().trim();
+                
+                // 키워드가 '역', '구', '동' 등으로 끝나는 경우 이를 제거하고 더 넓게 검색
+                String locationKeywordWithoutSuffix = locationKeyword;
+                if (locationKeyword.endsWith("역")) {
+                    locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                } else if (locationKeyword.endsWith("구")) {
+                    locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                } else if (locationKeyword.endsWith("동")) {
+                    locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                }
+                
+                // 원본 키워드 또는 접미사 제거한 키워드가 포함되어 있으면 통과
+                if (item.getLocation() == null) {
+                    return false;
+                }
+                String itemLocation = item.getLocation().toLowerCase();
+                boolean matches = itemLocation.contains(locationKeyword);
+                if (!matches && !locationKeywordWithoutSuffix.equals(locationKeyword) && locationKeywordWithoutSuffix.length() > 0) {
+                    matches = itemLocation.contains(locationKeywordWithoutSuffix);
+                }
+                if (!matches) {
                     return false;
                 }
             }
         }
 
         // 브랜드 필터 (부분 일치)
+        // itemName, description, brand 필드 모두에서 검색
         if (request.brand() != null && !request.brand().trim().isEmpty()) {
             String brand = request.brand().toLowerCase().trim();
-            if (item.getBrand() == null || !item.getBrand().toLowerCase().contains(brand)) {
+            
+            // itemName에서 검색
+            boolean matchesItemName = item.getItemName() != null && 
+                    item.getItemName().toLowerCase().contains(brand);
+            
+            // description에서 검색
+            boolean matchesDescription = item.getDescription() != null && 
+                    item.getDescription().toLowerCase().contains(brand);
+            
+            // brand 필드에서 검색
+            boolean matchesBrand = item.getBrand() != null && 
+                    item.getBrand().toLowerCase().contains(brand);
+            
+            // 하나라도 매치되면 통과
+            if (!matchesItemName && !matchesDescription && !matchesBrand) {
+                log.debug("브랜드 필터 실패: itemId={}, itemName='{}', description='{}', brand='{}', 검색 브랜드='{}'", 
+                        item.getId(), item.getItemName(), 
+                        item.getDescription() != null ? item.getDescription().substring(0, Math.min(50, item.getDescription().length())) : null,
+                        item.getBrand(), brand);
                 return false;
             }
+            
+            log.debug("브랜드 필터 통과: itemId={}, matchesItemName={}, matchesDescription={}, matchesBrand={}, 검색 브랜드='{}'", 
+                    item.getId(), matchesItemName, matchesDescription, matchesBrand, brand);
         }
 
         // 날짜 필터 (해당 날짜 이후)
