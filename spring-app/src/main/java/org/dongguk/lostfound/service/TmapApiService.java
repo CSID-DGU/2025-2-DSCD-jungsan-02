@@ -191,6 +191,7 @@ public class TmapApiService {
             log.info("TMap 장소 검색 요청: placeName={}", placeName);
 
             // TMap Search API 호출: GET /search/poi?version=1
+            // GET 요청에는 Content-Type 헤더가 필요 없으므로 제거
             var responseEntity = tmapRestClient.get()
                     .uri(uriBuilder -> uriBuilder
                             .path("/search/poi")
@@ -202,13 +203,30 @@ public class TmapApiService {
                             .queryParam("resCoordType", "WGS84GEO")
                             .queryParam("count", "1")  // 첫 번째 결과만
                             .build())
+                    .headers(headers -> {
+                        // GET 요청에서는 Content-Type 제거
+                        headers.remove("Content-Type");
+                        // 요청 헤더 로깅 (디버깅용)
+                        log.debug("TMap API 요청 헤더: {}", headers);
+                    })
                     .retrieve()
                     .onStatus(status -> status.value() == 403, (request, response) -> {
-                        log.error("TMap 장소 검색 API 인증 실패 (403). 응답 본문: {}", 
-                                response.getBody() != null ? response.getBody().toString() : "null");
+                        // 응답 본문 읽기
+                        String responseBody = "읽기 실패";
+                        try {
+                            if (response.getBody() != null) {
+                                java.io.InputStream inputStream = response.getBody();
+                                responseBody = new String(inputStream.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                            }
+                        } catch (Exception ex) {
+                            log.warn("응답 본문 읽기 실패: {}", ex.getMessage());
+                        }
+                        log.error("TMap 장소 검색 API 인증 실패 (403). 응답 본문: {}", responseBody);
+                        log.error("요청 URL: {}", request.getURI());
+                        log.error("요청 헤더: {}", request.getHeaders());
                         throw new org.springframework.web.client.HttpClientErrorException(
                                 org.springframework.http.HttpStatus.FORBIDDEN,
-                                "TMap API 인증 실패"
+                                "TMap API 인증 실패: " + responseBody
                         );
                     })
                     .onStatus(status -> status.value() == 429, (request, response) -> {

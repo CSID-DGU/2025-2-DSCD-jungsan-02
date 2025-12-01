@@ -29,6 +29,7 @@ public class TmapConfig {
         
         log.info("TMap API URL: {}", tmapApiUrl);
         
+        // POST 요청용 (Content-Type 포함)
         return RestClient.builder()
                 .baseUrl(tmapApiUrl)
                 .defaultHeader("appKey", tmapApiKey)
