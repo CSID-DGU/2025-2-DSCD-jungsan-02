@@ -118,6 +118,31 @@ def check_and_free_disk_space(min_free_gb: float = 5.0):
         print(f"⚠️ 디스크 공간 확인 실패: {e}")
         return True  # 실패해도 계속 진행
 
+def _validate_faiss_file(file_path: str) -> bool:
+    """FAISS 파일이 유효한지 검증"""
+    if not os.path.exists(file_path):
+        return False
+    
+    file_size = os.path.getsize(file_path)
+    if file_size == 0:
+        return False
+    
+    # 파일 읽기 시도로 손상 여부 확인
+    try:
+        if file_path.endswith('.idx'):
+            # FAISS 인덱스 파일 검증: 파일을 읽어서 유효성 확인
+            test_index = faiss.read_index(file_path)
+            return True
+        elif file_path.endswith('.pkl'):
+            # Pickle 파일 검증: 파일을 읽어서 유효성 확인
+            with open(file_path, 'rb') as f:
+                pickle.load(f)
+            return True
+    except Exception:
+        return False
+    
+    return True
+
 def initialize_faiss():
     """FAISS 인덱스 초기화 또는 로드 (한 번만 실행)
     
@@ -140,74 +165,54 @@ def initialize_faiss():
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         
         try:
-            if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(FAISS_MAPPING_PATH):
-                # 파일 크기 먼저 확인 (0바이트 파일은 손상된 것으로 간주)
-                index_size = os.path.getsize(FAISS_INDEX_PATH)
-                mapping_size = os.path.getsize(FAISS_MAPPING_PATH)
+            # 파일 유효성 검증 (손상된 파일 자동 삭제)
+            index_valid = _validate_faiss_file(FAISS_INDEX_PATH) if os.path.exists(FAISS_INDEX_PATH) else False
+            mapping_valid = _validate_faiss_file(FAISS_MAPPING_PATH) if os.path.exists(FAISS_MAPPING_PATH) else False
+            
+            if not index_valid or not mapping_valid:
+                if os.path.exists(FAISS_INDEX_PATH) and not index_valid:
+                    print(f"⚠️ 손상된 FAISS 인덱스 파일 감지. 삭제합니다.")
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup_path = f"{FAISS_INDEX_PATH}.corrupted_{timestamp}"
+                    try:
+                        shutil.move(FAISS_INDEX_PATH, backup_path)
+                        print(f"   백업: {backup_path}")
+                    except:
+                        os.remove(FAISS_INDEX_PATH)
                 
-                if index_size == 0 or mapping_size == 0:
-                    print(f"⚠️ FAISS 파일 크기가 0입니다 (인덱스: {index_size}바이트, 매핑: {mapping_size}바이트). 삭제하고 새로 생성합니다.")
+                if os.path.exists(FAISS_MAPPING_PATH) and not mapping_valid:
+                    print(f"⚠️ 손상된 FAISS 매핑 파일 감지. 삭제합니다.")
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup_path = f"{FAISS_MAPPING_PATH}.corrupted_{timestamp}"
+                    try:
+                        shutil.move(FAISS_MAPPING_PATH, backup_path)
+                        print(f"   백업: {backup_path}")
+                    except:
+                        os.remove(FAISS_MAPPING_PATH)
+            
+            # 유효한 파일이 있으면 로드
+            if index_valid and mapping_valid:
+                try:
+                    index_size = os.path.getsize(FAISS_INDEX_PATH)
+                    print(f"📖 FAISS 인덱스 파일 로드 시도 (크기: {index_size / 1024 / 1024:.2f}MB)...")
+                    faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+                    with open(FAISS_MAPPING_PATH, 'rb') as f:
+                        id_mapping = pickle.load(f)
+                    index_type_name = type(faiss_index).__name__
+                    print(f"✅ FAISS 인덱스 로드: {faiss_index.ntotal}개 벡터 (타입: {index_type_name}, 크기: {index_size / 1024 / 1024:.2f}MB)")
+                    
+                    # HNSW 인덱스인 경우 ef_search 설정
+                    if hasattr(faiss_index, 'hnsw'):
+                        faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
+                        print(f"   HNSW 파라미터 설정: ef_search={HNSW_EF_SEARCH}")
+                except Exception as e:
+                    print(f"❌ FAISS 인덱스 로드 실패: {e}")
+                    print(f"🔄 새 인덱스를 생성합니다...")
+                    # 파일 삭제
                     if os.path.exists(FAISS_INDEX_PATH):
                         os.remove(FAISS_INDEX_PATH)
                     if os.path.exists(FAISS_MAPPING_PATH):
                         os.remove(FAISS_MAPPING_PATH)
-                else:
-                    # 파일 로드 시도 (손상된 파일 처리)
-                    try:
-                        print(f"📖 FAISS 인덱스 파일 로드 시도 (크기: {index_size / 1024 / 1024:.2f}MB)...")
-                        faiss_index = faiss.read_index(FAISS_INDEX_PATH)
-                        with open(FAISS_MAPPING_PATH, 'rb') as f:
-                            id_mapping = pickle.load(f)
-                        index_type_name = type(faiss_index).__name__
-                        print(f"✅ FAISS 인덱스 로드: {faiss_index.ntotal}개 벡터 (타입: {index_type_name}, 크기: {index_size / 1024 / 1024:.2f}MB)")
-                        
-                        # HNSW 인덱스인 경우 ef_search 설정
-                        if hasattr(faiss_index, 'hnsw'):
-                            faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
-                            print(f"   HNSW 파라미터 설정: ef_search={HNSW_EF_SEARCH}")
-                        
-                        # 인덱스 타입 불일치 경고 (설정과 다른 경우)
-                        if FAISS_INDEX_TYPE.upper() == "HNSW" and "Flat" in index_type_name and "HNSW" not in index_type_name:
-                            print(f"⚠️ 경고: 설정은 HNSW이지만 기존 인덱스는 {index_type_name}입니다.")
-                            print(f"   기존 인덱스를 사용합니다. 새 인덱스를 원하면 기존 파일을 삭제하세요.")
-                        elif FAISS_INDEX_TYPE.upper() == "FLAT" and "HNSW" in index_type_name:
-                            print(f"⚠️ 경고: 설정은 Flat이지만 기존 인덱스는 {index_type_name}입니다.")
-                            print(f"   기존 인덱스를 사용합니다. 새 인덱스를 원하면 기존 파일을 삭제하세요.")
-                    except (RuntimeError, IOError, Exception) as e:
-                        # 인덱스 파일이 손상된 경우 백업하고 새로 생성
-                        print(f"❌ FAISS 인덱스 파일 손상 감지: {e}")
-                        print(f"🔄 손상된 파일을 백업하고 새 인덱스를 생성합니다...")
-                        
-                        # 손상된 파일 백업 (이미 파일 잠금을 가지고 있음)
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        backup_index_path = f"{FAISS_INDEX_PATH}.corrupted_{timestamp}"
-                        backup_mapping_path = f"{FAISS_MAPPING_PATH}.corrupted_{timestamp}"
-                        
-                        try:
-                            if os.path.exists(FAISS_INDEX_PATH):
-                                shutil.move(FAISS_INDEX_PATH, backup_index_path)
-                                print(f"   백업: {backup_index_path}")
-                            if os.path.exists(FAISS_MAPPING_PATH):
-                                shutil.move(FAISS_MAPPING_PATH, backup_mapping_path)
-                                print(f"   백업: {backup_mapping_path}")
-                        except Exception as backup_error:
-                            print(f"   ⚠️ 백업 실패 (무시하고 계속): {backup_error}")
-                            # 백업 실패해도 파일 삭제 시도
-                            try:
-                                if os.path.exists(FAISS_INDEX_PATH):
-                                    os.remove(FAISS_INDEX_PATH)
-                                if os.path.exists(FAISS_MAPPING_PATH):
-                                    os.remove(FAISS_MAPPING_PATH)
-                            except:
-                                pass
-                        
-                        # 새 인덱스 생성으로 진행
-                        print(f"   새 인덱스를 생성합니다...")
-                        # 아래 블록으로 진행하기 위해 파일이 없도록 설정
-                        if os.path.exists(FAISS_INDEX_PATH):
-                            os.remove(FAISS_INDEX_PATH)
-                        if os.path.exists(FAISS_MAPPING_PATH):
-                            os.remove(FAISS_MAPPING_PATH)
             
             # 인덱스 파일이 없거나 손상된 경우 새로 생성
             if not os.path.exists(FAISS_INDEX_PATH) or not os.path.exists(FAISS_MAPPING_PATH):
