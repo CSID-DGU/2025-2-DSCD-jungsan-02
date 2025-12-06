@@ -4,19 +4,29 @@ FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 # 작업 디렉토리 설정
 WORKDIR /app
 
-# 필수 패키지 설치
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y \
-    python3 python3-venv python3-pip git build-essential \
-    && rm -rf /var/lib/apt/lists/*
+# 환경 변수 설정 (pip 캐시 비활성화)
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1
 
-# python 명령어 심볼릭 링크 (python3 -> python)
-RUN ln -s /usr/bin/python3 /usr/bin/python
+# 필수 패키지 설치 및 캐시 정리 (한 번에 처리하여 레이어 최소화)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /tmp/* \
+    && rm -rf /var/tmp/* \
+    && ln -s /usr/bin/python3 /usr/bin/python
 
-# requirements 설치
+# pip 업그레이드 및 requirements 설치 (한 번에 처리)
 COPY requirements.txt .
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip cache purge && \
+    rm -rf /root/.cache/pip /root/.cache/huggingface /tmp/* /var/tmp/* && \
+    find /usr/local/lib/python3.*/dist-packages -type d -name __pycache__ -exec rm -r {} + 2>/dev/null || true && \
+    find /usr/local/lib/python3.*/dist-packages -name "*.pyc" -delete 2>/dev/null || true
 
 # 소스 복사
 COPY . .
