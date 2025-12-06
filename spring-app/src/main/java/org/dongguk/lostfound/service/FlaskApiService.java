@@ -76,9 +76,38 @@ public class FlaskApiService {
     }
 
     /**
-     * Flask AI 서버에 검색 요청 (item_id 리스트 반환)
+     * Flask AI 서버에 검색 요청 (item_id 리스트와 점수 반환)
+     */
+    public static class SearchResult {
+        private final List<Long> itemIds;
+        private final List<Double> scores;
+        
+        public SearchResult(List<Long> itemIds, List<Double> scores) {
+            this.itemIds = itemIds;
+            this.scores = scores;
+        }
+        
+        public List<Long> getItemIds() {
+            return itemIds;
+        }
+        
+        public List<Double> getScores() {
+            return scores;
+        }
+    }
+    
+    /**
+     * Flask AI 서버에 검색 요청 (item_id 리스트 반환) - 하위 호환성 유지
      */
     public List<Long> searchSimilarItems(String query, Integer topK) {
+        SearchResult result = searchSimilarItemsWithScores(query, topK);
+        return result.getItemIds();
+    }
+    
+    /**
+     * Flask AI 서버에 검색 요청 (item_id 리스트와 점수 반환)
+     */
+    public SearchResult searchSimilarItemsWithScores(String query, Integer topK) {
         try {
             Map<String, Object> request = Map.of(
                     "query", query,
@@ -96,18 +125,28 @@ public class FlaskApiService {
                 List<Integer> itemIds = (List<Integer>) response.get("item_ids");
                 List<Double> scores = (List<Double>) response.get("scores");
                 
+                List<Long> longItemIds = itemIds != null ? 
+                        itemIds.stream().map(Long::valueOf).toList() : 
+                        new ArrayList<>();
+                List<Double> doubleScores = scores != null ? 
+                        scores : 
+                        new ArrayList<>();
+                
                 // 디버깅: 유사도 점수 확인
-                if (scores != null && !scores.isEmpty()) {
-                    log.info("Flask 검색 결과 - 상위 5개 유사도 점수: {}", 
-                            scores.stream()
-                                    .limit(5)
+                if (!doubleScores.isEmpty()) {
+                    log.info("Flask 검색 결과 - 상위 10개 유사도 점수: {}", 
+                            doubleScores.stream()
+                                    .limit(10)
                                     .map(score -> String.format("%.4f", score))
                                     .collect(Collectors.joining(", ")));
+                    double maxScore = doubleScores.stream().mapToDouble(Double::doubleValue).max().orElse(0.0);
+                    double minScore = doubleScores.stream().mapToDouble(Double::doubleValue).min().orElse(0.0);
+                    log.info("Flask 검색 결과 - 점수 범위: 최고={}, 최저={}", 
+                            String.format("%.4f", maxScore),
+                            String.format("%.4f", minScore));
                 }
                 
-                return itemIds.stream()
-                        .map(Long::valueOf)
-                        .toList();
+                return new SearchResult(longItemIds, doubleScores);
             }
             
             throw new RuntimeException("Failed to search embeddings: " + response);
@@ -115,7 +154,7 @@ public class FlaskApiService {
         } catch (Exception e) {
             log.warn("Flask AI 서버에 연결할 수 없습니다. 빈 결과를 반환합니다. query: {}", query);
             // Flask 서버가 꺼져있을 때 빈 리스트 반환 (fallback)
-            return new ArrayList<>();
+            return new SearchResult(new ArrayList<>(), new ArrayList<>());
         }
     }
 

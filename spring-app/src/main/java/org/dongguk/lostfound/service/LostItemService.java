@@ -30,7 +30,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Map;
-import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 import java.io.IOException;
@@ -444,15 +445,26 @@ public class LostItemService {
     }
 
     /**
-     * AI 검색 (자연어 검색)
-     * 1. Flask AI 서버에 검색어 전송
-     * 2. 유사한 분실물 ID 리스트 받음
-     * 3. MySQL에서 해당 분실물들 조회
+     * AI 검색 (하이브리드 검색: 키워드 매칭 + 시맨틱 검색)
+     * 1. 키워드 기반 검색 (제목/설명/브랜드에 검색어 포함) - 우선순위 높음
+     * 2. Flask AI 서버에 검색어 전송하여 시맨틱 검색
+     * 3. 키워드 매칭 결과를 상위에 배치하고 시맨틱 검색 결과 추가
      * 4. 필터가 있으면 필터 적용
      */
     public LostItemListDto searchLostItems(SearchLostItemRequest request) {
-        log.info("Searching lost items with query: {}, filters: category={}, location={}, brand={}, foundDateAfter={}", 
+        log.debug("Searching lost items with query: {}, filters: category={}, location={}, brand={}, foundDateAfter={}", 
                 request.query(), request.category(), request.location(), request.brand(), request.foundDateAfter());
+
+        String searchQuery = request.query() != null ? request.query().trim() : "";
+        if (searchQuery.isEmpty()) {
+            log.warn("검색어가 비어있습니다.");
+            return LostItemListDto.builder()
+                    .items(List.of())
+                    .totalCount(0)
+                    .page(0)
+                    .size(0)
+                    .build();
+        }
 
         // 장소 필터링을 위한 좌표 미리 변환 (중복 호출 방지)
         TmapApiService.TmapPlaceResult locationPlaceResult = null;
@@ -467,63 +479,84 @@ public class LostItemService {
         // final 변수로 복사 (람다에서 사용하기 위해)
         final TmapApiService.TmapPlaceResult finalLocationPlaceResult = locationPlaceResult;
 
-        // 1. Flask AI 서버에 검색 요청 (필터를 고려하여 더 많이 가져옴)
-        // 필터가 많을수록 더 많이 가져와서 필터링 후에도 충분한 결과를 얻을 수 있도록 함
-        int searchTopK = request.topK();
-        int filterCount = 0;
-        if (request.category() != null) filterCount++;
-        if (request.location() != null && !request.location().trim().isEmpty()) filterCount++;
-        if (request.brand() != null && !request.brand().trim().isEmpty()) filterCount++;
-        if (request.foundDateAfter() != null) filterCount++;
-        
-        // 필터 개수에 따라 더 많이 가져옴 (필터가 많을수록 더 많이)
-        if (filterCount > 0) {
-            searchTopK = request.topK() * Math.max(3, filterCount * 2); // 최소 3배, 필터당 2배씩 증가
-        }
-        
-        log.info("자연어 검색 요청: query={}, topK={} (필터 개수: {})", request.query(), searchTopK, filterCount);
-        
-        List<Long> itemIds = flaskApiService.searchSimilarItems(
-                request.query(),
-                searchTopK
+        // 1. 키워드 검색과 시맨틱 검색을 병렬로 실행 (성능 개선)
+        // 시맨틱 검색 topK 최적화: 키워드 매칭 결과를 고려하여 필요한 만큼만 가져옴
+        // 키워드 매칭이 있으면 그만큼 덜 가져와도 됨
+        int semanticSearchTopK = Math.min(
+                Math.max(request.topK() * 2, 50),  // 최소 50개, 최대 topK * 2
+                200  // 최대 200개로 제한 (너무 많이 가져오지 않음)
         );
+        
+        // 병렬 실행을 위한 CompletableFuture 사용
+        CompletableFuture<List<LostItem>> keywordSearchFuture = 
+                CompletableFuture.supplyAsync(() -> 
+                        searchByKeyword(searchQuery, request));
+        
+        CompletableFuture<FlaskApiService.SearchResult> semanticSearchFuture = 
+                CompletableFuture.supplyAsync(() -> 
+                        flaskApiService.searchSimilarItemsWithScores(searchQuery, semanticSearchTopK));
+        
+        // 두 검색 결과를 모두 기다림
+        List<LostItem> keywordMatchedItems = keywordSearchFuture.join();
+        FlaskApiService.SearchResult searchResult = semanticSearchFuture.join();
+        
+        Set<Long> keywordMatchedIds = keywordMatchedItems.stream()
+                .map(LostItem::getId)
+                .collect(Collectors.toSet());
+        
+        List<Long> semanticItemIds = searchResult.getItemIds();
+        List<Double> semanticScores = searchResult.getScores();
+        
+        log.info("키워드 매칭 결과: {}개, 시맨틱 검색 결과: {}개 (검색어: '{}')", 
+                keywordMatchedItems.size(), semanticItemIds.size(), searchQuery);
 
-        if (itemIds.isEmpty()) {
-            log.warn("Flask AI 서버에서 검색 결과가 없습니다. query={}", request.query());
-            return LostItemListDto.builder()
-                    .items(List.of())
-                    .totalCount(0)
-                    .page(0)
-                    .size(0)
-                    .build();
+        // 2. 점수 기반 필터링을 먼저 수행하여 불필요한 DB 조회 방지
+        double scoreThreshold = 0.3;
+        List<Long> filteredSemanticIds = new java.util.ArrayList<>();
+        Map<Long, Double> itemScoreMap = new java.util.HashMap<>();
+        
+        for (int i = 0; i < semanticItemIds.size(); i++) {
+            Long itemId = semanticItemIds.get(i);
+            // 키워드 매칭 결과는 제외
+            if (keywordMatchedIds.contains(itemId)) {
+                continue;
+            }
+            
+            Double score = i < semanticScores.size() ? semanticScores.get(i) : 0.0;
+            // 점수 필터링: 임계값 이상인 것만 포함
+            if (score >= scoreThreshold) {
+                filteredSemanticIds.add(itemId);
+                itemScoreMap.put(itemId, score);
+            }
+        }
+        
+        log.debug("시맨틱 검색 점수 필터링: 전체 {}개 중 점수 {} 이상인 아이템 {}개", 
+                semanticItemIds.size(), scoreThreshold, filteredSemanticIds.size());
+        
+        // 3. 필터링된 ID만 DB에서 조회 (배치로 나누어 조회)
+        List<LostItem> scoredSemanticItems = new java.util.ArrayList<>();
+        if (!filteredSemanticIds.isEmpty()) {
+            // 배치 크기: MySQL IN 절 제한 고려 (일반적으로 1000개 이하 권장)
+            int batchSize = 500;
+            for (int i = 0; i < filteredSemanticIds.size(); i += batchSize) {
+                int end = Math.min(i + batchSize, filteredSemanticIds.size());
+                List<Long> batchIds = filteredSemanticIds.subList(i, end);
+                List<LostItem> batchItems = lostItemRepository.findAllById(batchIds);
+                scoredSemanticItems.addAll(batchItems);
+            }
         }
 
-        // 2. MySQL에서 해당 분실물들 조회
-        List<LostItem> lostItems = lostItemRepository.findAllById(itemIds);
+        // 6. 키워드 매칭 결과와 시맨틱 검색 결과 합치기 (키워드 매칭이 우선)
+        List<LostItem> combinedItems = new java.util.ArrayList<>();
+        combinedItems.addAll(keywordMatchedItems); // 키워드 매칭 결과를 먼저 추가
+        combinedItems.addAll(scoredSemanticItems);  // 시맨틱 검색 결과 추가
         
-        log.info("Flask AI에서 받은 itemIds: {}개, MySQL에서 조회된 아이템: {}개", itemIds.size(), lostItems.size());
-        
-        // 3. Map으로 변환하여 O(1) 조회 성능 확보 (findAllById는 순서 보장 안 함)
-        Map<Long, LostItem> itemMap = lostItems.stream()
-                .collect(Collectors.toMap(LostItem::getId, item -> item));
-        
-        // 조회되지 않은 itemIds 확인 (디버깅용)
-        List<Long> notFoundIds = itemIds.stream()
-                .filter(id -> !itemMap.containsKey(id))
-                .limit(10)
-                .toList();
-        if (!notFoundIds.isEmpty()) {
-            log.warn("MySQL에서 조회되지 않은 itemIds (상위 10개): {}", notFoundIds);
-        }
-
-        // 4. FAISS에서 반환된 순서대로 아이템 조회 및 필터 적용
+        // 7. 필터 적용
         boolean hasFilters = hasFilters(request);
         log.info("필터 적용 여부: {}, 필터 조건: category={}, location={}, brand={}, foundDateAfter={}", 
                 hasFilters, request.category(), request.location(), request.brand(), request.foundDateAfter());
         
-        List<LostItem> filteredItems = itemIds.stream()
-                .map(itemMap::get)
-                .filter(Objects::nonNull)
+        List<LostItem> filteredItems = combinedItems.stream()
                 .filter(item -> {
                     if (!hasFilters) {
                         return true; // 필터가 없으면 모두 통과
@@ -537,34 +570,177 @@ public class LostItemService {
                 })
                 .toList();
         
-        log.info("필터 적용 전: {}개, 필터 적용 후: {}개", itemIds.size(), filteredItems.size());
+        log.info("필터 적용 전: {}개 (키워드: {}, 시맨틱: {}), 필터 적용 후: {}개", 
+                combinedItems.size(), keywordMatchedItems.size(), scoredSemanticItems.size(), filteredItems.size());
         
-        // 필터링된 결과를 DTO로 변환 (FAISS 순서 유지)
-        List<LostItemDto> items = filteredItems.stream()
+        // 8. 페이지네이션 적용
+        int totalCount = filteredItems.size();
+        int page = request.page() != null ? request.page() : 0;
+        int size = request.size() != null ? request.size() : 20;
+        
+        // 메모리에서 페이징 적용
+        int start = page * size;
+        int end = Math.min(start + size, totalCount);
+        
+        List<LostItem> pagedItems = start < totalCount ? filteredItems.subList(start, end) : List.of();
+        
+        // 9. 최종 결과 반환 (키워드 매칭 우선, 그 다음 시맨틱 검색)
+        List<LostItemDto> items = pagedItems.stream()
                 .map(LostItemDto::from)
-                .limit(request.topK()) // 최종 결과는 요청한 개수만큼만
                 .toList();
-
-        // 디버깅: 순서 및 유사도 점수 확인 로그
+        
+        // 요약 로그만 출력 (상세 로그는 debug 레벨로)
         if (!items.isEmpty()) {
-            log.info("✅ 최종 검색 결과 순서 (상위 5개): {}", 
+            // 카테고리별 분포 확인 (전체 결과 기준)
+            Map<String, Long> categoryCounts = filteredItems.stream()
+                    .collect(Collectors.groupingBy(
+                            item -> item.getCategory() != null ? item.getCategory().toString() : "NULL",
+                            Collectors.counting()
+                    ));
+            
+            // 키워드 매칭 vs 시맨틱 검색 비율 (전체 결과 기준)
+            long keywordCount = filteredItems.stream()
+                    .filter(item -> keywordMatchedIds.contains(item.getId()))
+                    .count();
+            
+            log.info("검색 완료: 전체 {}개 (키워드: {}개, 시맨틱: {}개), 페이지: {}/{}, 카테고리 분포: {}", 
+                    totalCount, keywordCount, totalCount - keywordCount, page + 1, 
+                    (int) Math.ceil((double) totalCount / size), categoryCounts);
+            
+            // 상세 로그는 debug 레벨로
+            log.debug("최종 검색 결과 순서 (상위 10개): {}", 
                     items.stream()
-                            .limit(5)
+                            .limit(10)
                             .map(item -> String.format("%d:%s", item.id(), item.itemName()))
-                            .collect(Collectors.joining(", ")));
-            log.info("📊 FAISS에서 받은 itemIds 순서 (상위 5개): {}", 
-                    itemIds.stream()
-                            .limit(5)
-                            .map(String::valueOf)
                             .collect(Collectors.joining(", ")));
         }
 
         return LostItemListDto.builder()
                 .items(items)
-                .totalCount(items.size())
-                .page(0)
-                .size(items.size())
+                .totalCount(totalCount) // 실제 전체 개수 반환
+                .page(page)
+                .size(size)
                 .build();
+    }
+    
+    /**
+     * 키워드 기반 검색 (제목/설명/브랜드에 검색어 포함)
+     * 성능 최적화: DB 레벨에서 정렬 및 제한, 메모리 필터링 최소화
+     */
+    private List<LostItem> searchByKeyword(String keyword, SearchLostItemRequest request) {
+        if (keyword == null || keyword.trim().isEmpty()) {
+            return List.of();
+        }
+        
+        String searchKeyword = keyword.toLowerCase().trim();
+        
+        // 특수문자 이스케이프 처리
+        char escapeChar = '!';
+        String escapedKeyword = searchKeyword
+                .replace("!", "!!")
+                .replace("%", "!%")
+                .replace("_", "!_");
+        String pattern = "%" + escapedKeyword + "%";
+        
+        // 장소 필터링을 위한 좌표 미리 계산 (메모리 필터링 최소화)
+        TmapApiService.TmapPlaceResult locationPlaceResult = null;
+        double locationRadius = 10000.0; // 기본값 10km
+        if (request.location() != null && !request.location().trim().isEmpty()) {
+            locationPlaceResult = tmapApiService.searchPlace(request.location().trim());
+        }
+        final TmapApiService.TmapPlaceResult finalLocationPlaceResult = locationPlaceResult;
+        final double finalLocationRadius = locationRadius;
+        
+        // Specification 생성: 모든 필터를 한 번에 적용
+        Specification<LostItem> spec = (root, query, cb) -> {
+            List<Predicate> predicates = new java.util.ArrayList<>();
+            
+            // 키워드 매칭: itemName, description, brand 중 하나라도 포함
+            predicates.add(cb.or(
+                    cb.like(cb.lower(root.get("itemName")), pattern, escapeChar),
+                    cb.like(cb.lower(root.get("description")), pattern, escapeChar),
+                    cb.and(
+                            cb.isNotNull(root.get("brand")),
+                            cb.like(cb.lower(root.get("brand")), pattern, escapeChar)
+                    )
+            ));
+            
+            // 카테고리 필터
+            if (request.category() != null) {
+                predicates.add(cb.equal(root.get("category"), request.category()));
+            }
+            
+            // 날짜 필터
+            if (request.foundDateAfter() != null) {
+                predicates.add(cb.greaterThanOrEqualTo(root.get("foundDate"), request.foundDateAfter()));
+            }
+            
+            // 브랜드 필터 (키워드와 별도로 브랜드 필터가 있는 경우)
+            if (request.brand() != null && !request.brand().trim().isEmpty()) {
+                String brandFilter = request.brand().toLowerCase().trim();
+                String brandPattern = "%" + brandFilter
+                        .replace("!", "!!")
+                        .replace("%", "!%")
+                        .replace("_", "!_") + "%";
+                predicates.add(cb.or(
+                        cb.like(cb.lower(root.get("itemName")), brandPattern, escapeChar),
+                        cb.like(cb.lower(root.get("description")), brandPattern, escapeChar),
+                        cb.and(
+                                cb.isNotNull(root.get("brand")),
+                                cb.like(cb.lower(root.get("brand")), brandPattern, escapeChar)
+                        )
+                ));
+            }
+            
+            // 장소 필터 (좌표 기반 - 대략적인 범위로 먼저 필터링)
+            if (finalLocationPlaceResult != null) {
+                // 대략적인 반경 계산 (1도 ≈ 111km)
+                double radiusInDegrees = finalLocationRadius / 111000.0;
+                predicates.add(cb.and(
+                        cb.isNotNull(root.get("latitude")),
+                        cb.isNotNull(root.get("longitude")),
+                        cb.between(root.get("latitude"), 
+                                finalLocationPlaceResult.getLatitude() - radiusInDegrees,
+                                finalLocationPlaceResult.getLatitude() + radiusInDegrees),
+                        cb.between(root.get("longitude"),
+                                finalLocationPlaceResult.getLongitude() - radiusInDegrees,
+                                finalLocationPlaceResult.getLongitude() + radiusInDegrees)
+                ));
+            } else if (request.location() != null && !request.location().trim().isEmpty()) {
+                // 좌표 변환 실패 시 문자열 일치 방식으로 폴백
+                String locationKeyword = request.location().toLowerCase().trim();
+                String locationPattern = "%" + locationKeyword
+                        .replace("!", "!!")
+                        .replace("%", "!%")
+                        .replace("_", "!_") + "%";
+                predicates.add(cb.like(cb.lower(root.get("location")), locationPattern, escapeChar));
+            }
+            
+            return cb.and(predicates.toArray(new Predicate[0]));
+        };
+        
+        // DB 레벨에서 정렬 및 제한 (메모리 정렬 최소화)
+        Pageable pageable = PageRequest.of(0, 100, Sort.by(Sort.Direction.DESC, "foundDate"));
+        Page<LostItem> itemPage = lostItemRepository.findAll(spec, pageable);
+        List<LostItem> items = itemPage.getContent();
+        
+        // 좌표 기반 필터링이 있는 경우: 정확한 거리 계산으로 재필터링 (DB에서 대략적으로 필터링된 후)
+        if (finalLocationPlaceResult != null) {
+            items = items.stream()
+                    .filter(item -> {
+                        if (item.getLatitude() == null || item.getLongitude() == null) {
+                            return false;
+                        }
+                        double distance = calculateHaversineDistance(
+                                finalLocationPlaceResult.getLatitude(), finalLocationPlaceResult.getLongitude(),
+                                item.getLatitude(), item.getLongitude()
+                        );
+                        return distance <= finalLocationRadius;
+                    })
+                    .toList();
+        }
+        
+        return items;
     }
 
     /**
