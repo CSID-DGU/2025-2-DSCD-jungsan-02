@@ -13,9 +13,11 @@ import concurrent.futures
 import requests
 import json
 import time
+from functools import lru_cache
+import hashlib
 
 from services.captioning import generate_caption
-from services.text_processing import preprocess_text
+from services.text_processing import preprocess_text, expand_search_query
 
 app = Flask(__name__)
 CORS(app)
@@ -33,6 +35,12 @@ FAISS_INDEX_TYPE = os.getenv("FAISS_INDEX_TYPE", "HNSW")  # "HNSW" or "Flat"
 HNSW_M = int(os.getenv("HNSW_M", "32"))  # HNSW 파라미터: 연결 수 (16-64, 높을수록 정확하지만 느림)
 HNSW_EF_CONSTRUCTION = int(os.getenv("HNSW_EF_CONSTRUCTION", "200"))  # HNSW 빌드 시 탐색 범위
 HNSW_EF_SEARCH = int(os.getenv("HNSW_EF_SEARCH", "128"))  # HNSW 검색 시 탐색 범위 (높을수록 정확하지만 느림)
+
+# 검색 성능 개선: 유사도 임계값 설정
+# IndexFlatIP은 내적 값 (코사인 유사도 * 벡터 크기), 정규화된 벡터는 0~1 범위
+# BGE-M3는 정규화된 임베딩을 사용하므로 코사인 유사도는 대략 0.3~0.95 범위
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.3"))  # 최소 유사도 임계값 (0.3 = 30%)
+MIN_RESULTS_TO_RETURN = int(os.getenv("MIN_RESULTS_TO_RETURN", "3"))  # 최소 반환 결과 수
 
 # ========== 전역 변수 ==========
 faiss_index = None
@@ -134,38 +142,47 @@ def describe_image_with_llava(image_bytes):
         print(f"⚠️ 이미지 캡셔닝 실패: {exc}")
         return ""
 
-def create_embedding_vector(text, is_query: bool = False):
+# 임베딩 캐시 (자주 사용되는 텍스트의 임베딩 캐싱하여 리소스 절약)
+_embedding_cache = {}
+_embedding_cache_lock = threading.Lock()
+EMBEDDING_CACHE_SIZE = 1000  # 최대 캐시 크기
+
+
+def _get_text_hash(text: str) -> str:
+    """텍스트의 해시값 생성 (캐시 키용)"""
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+
+def create_embedding_vector(text: str, use_cache: bool = True):
     """
     BGE-M3 모델을 사용하여 텍스트를 임베딩 벡터로 변환
     
-    Args:
-        text (str): 임베딩할 텍스트
-        is_query (bool): 검색 쿼리인지 여부 (기본값: False)
-                        True인 경우 instruction 프리픽스가 이미 포함되어 있음
+    리소스 절약: 자주 사용되는 텍스트는 캐싱하여 재사용
     
+    Args:
+        text (str): 임베딩할 텍스트 (이미지 묘사 + 사용자 입력 설명)
+        use_cache (bool): 캐시 사용 여부 (기본값: True)
+        
     Returns:
         numpy.ndarray: shape (EMBEDDING_DIMENSION,) 임베딩 벡터
     """
     if not text or not text.strip():
         raise ValueError("임베딩할 텍스트가 비어 있습니다.")
 
+    # 캐시 확인 (리소스 절약)
+    if use_cache:
+        text_hash = _get_text_hash(text)
+        with _embedding_cache_lock:
+            if text_hash in _embedding_cache:
+                return _embedding_cache[text_hash].copy()
+
     model = load_embedding_model()
-    
-    # BGE-M3는 instruction을 활용하면 검색 성능이 향상됨
-    # 저장 시: "이 문장을 기억합니다: " 프리픽스 사용
-    # 검색 시: "이 문장을 검색합니다: " 프리픽스 사용 (이미 적용됨)
-    if not is_query:
-        # 저장 시 instruction 프리픽스 추가
-        text_with_instruction = f"이 문장을 기억합니다: {text}"
-    else:
-        # 검색 시는 이미 프리픽스가 포함되어 있음
-        text_with_instruction = text
-    
     embedding = model.encode(
-        [text_with_instruction],
+        [text],
         convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=False,
+        batch_size=1,  # 배치 크기 명시
     )[0].astype("float32")
 
     if embedding.shape[0] != EMBEDDING_DIMENSION:
@@ -173,7 +190,90 @@ def create_embedding_vector(text, is_query: bool = False):
             f"임베딩 차원 불일치: 기대값={EMBEDDING_DIMENSION}, 실제값={embedding.shape[0]}"
         )
 
+    # 캐시 저장 (리소스 절약)
+    if use_cache:
+        with _embedding_cache_lock:
+            # 캐시 크기 제한 (LRU 방식으로 오래된 것 제거)
+            if len(_embedding_cache) >= EMBEDDING_CACHE_SIZE:
+                # 가장 오래된 항목 제거 (간단한 방식: 랜덤 제거)
+                oldest_key = next(iter(_embedding_cache))
+                del _embedding_cache[oldest_key]
+            _embedding_cache[text_hash] = embedding.copy()
+
     return embedding
+
+
+def create_embedding_vectors_batch(texts: list[str], use_cache: bool = True):
+    """
+    여러 텍스트를 배치로 임베딩 벡터로 변환 (리소스 효율적)
+    
+    배치 처리로 GPU 활용도 향상 및 처리 속도 개선
+    
+    Args:
+        texts (list[str]): 임베딩할 텍스트 리스트
+        use_cache (bool): 캐시 사용 여부 (기본값: True)
+        
+    Returns:
+        list[numpy.ndarray]: 임베딩 벡터 리스트
+    """
+    if not texts:
+        return []
+    
+    # 캐시 확인 및 미캐시된 텍스트만 필터링
+    uncached_texts = []
+    uncached_indices = []
+    cached_embeddings = {}
+    
+    if use_cache:
+        for idx, text in enumerate(texts):
+            if not text or not text.strip():
+                cached_embeddings[idx] = None
+                continue
+            text_hash = _get_text_hash(text)
+            with _embedding_cache_lock:
+                if text_hash in _embedding_cache:
+                    cached_embeddings[idx] = _embedding_cache[text_hash].copy()
+                else:
+                    uncached_texts.append(text)
+                    uncached_indices.append(idx)
+    else:
+        uncached_texts = [t for t in texts if t and t.strip()]
+        uncached_indices = list(range(len(uncached_texts)))
+    
+    # 배치 임베딩 생성
+    if uncached_texts:
+        model = load_embedding_model()
+        embeddings = model.encode(
+            uncached_texts,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=32,  # 배치 크기 최적화
+        ).astype("float32")
+        
+        # 캐시 저장
+        if use_cache:
+            with _embedding_cache_lock:
+                for text, embedding in zip(uncached_texts, embeddings):
+                    text_hash = _get_text_hash(text)
+                    if len(_embedding_cache) >= EMBEDDING_CACHE_SIZE:
+                        oldest_key = next(iter(_embedding_cache))
+                        del _embedding_cache[oldest_key]
+                    _embedding_cache[text_hash] = embedding.copy()
+        
+        # 결과 매핑
+        for idx, embedding in zip(uncached_indices, embeddings):
+            cached_embeddings[idx] = embedding
+    
+    # 원래 순서대로 반환
+    result = []
+    for i in range(len(texts)):
+        if i in cached_embeddings:
+            result.append(cached_embeddings[i])
+        else:
+            result.append(None)
+    
+    return result
 
 def create_embedding_from_image(image_bytes):
     """
@@ -196,7 +296,7 @@ def create_embedding_from_image(image_bytes):
     caption = describe_image_with_llava(image_bytes)
     if not caption:
         raise ValueError("이미지 캡셔닝 결과가 비어 있습니다.")
-    return create_embedding_vector(caption, is_query=False)
+    return create_embedding_vector(caption)
 
 
 def warmup_models():
@@ -244,7 +344,6 @@ def create_embedding():
     
     Spring에서 받는 것:
     - item_id: MySQL 분실물 ID (필수)
-    - item_name: 분실물 제목 (필수) - 예: "분홍색 지갑", "검은색 가방"
     - description: 사용자가 입력한 분실물 설명 (선택)
     - image: 분실물 이미지 파일 (선택)
     
@@ -255,7 +354,6 @@ def create_embedding():
     """
     try:
         item_id = request.form.get('item_id')
-        item_name = request.form.get('item_name', '')  # 분실물 제목 추가
         raw_description = request.form.get('description', '')
         image_file = request.files.get('image')
         
@@ -275,12 +373,9 @@ def create_embedding():
                 image_description = raw_description.strip()
             print(f"🖼️  이미지 분석 완료 (원본): {image_description[:100]}...")
         
-        # 2. 분실물 제목 + 이미지 묘사 + 사용자 설명 결합 (원본 텍스트로 결합)
-        #    예) "분홍색 지갑. 빨간색 가죽 지갑입니다. 신촌역 3번 출구에서 발견했습니다."
+        # 2. 이미지 묘사 + 사용자 설명 결합 (원본 텍스트로 결합)
+        #    예) "빨간색 가죽 지갑입니다. 신촌역 3번 출구에서 발견했습니다."
         parts = []
-        # 분실물 제목을 가장 먼저 추가 (검색 시 가장 중요)
-        if item_name and item_name.strip():
-            parts.append(item_name.strip())
         if image_description:
             parts.append(image_description)
         if raw_description and raw_description.strip():
@@ -292,14 +387,25 @@ def create_embedding():
         # 원본 텍스트 결합
         raw_full_text = " ".join(parts).strip()
         
-        # 3. 통합 전처리 (저장 시에는 맞춤법 교정 사용)
-        final_text = preprocess_text(raw_full_text, use_typo_correction=True)
+        # 3. 통합 전처리 (검색 시와 동일한 전처리 적용)
+        #    저장 시와 검색 시 동일한 전처리를 적용하여 일관성 보장
+        #    리소스 절약: 등록 시에는 맞춤법 교정을 선택적으로 사용
+        final_text = preprocess_text(
+            raw_full_text, 
+            use_typo_correction=True,  # 등록 시에는 맞춤법 교정 사용
+            optimize_for_search=True   # 검색 최적화 적용
+        )
         if not final_text or len(final_text.strip()) == 0:
-            # 전처리 실패 시 원본 사용
+            # 전처리 실패 시 원본 사용 (공백 제거만)
             final_text = raw_full_text.strip()
         
-        # 4. 임베딩 벡터 생성 (저장 시이므로 is_query=False)
-        embedding_vector = create_embedding_vector(final_text, is_query=False)
+        print(f"🧾 임베딩 텍스트: item_id={item_id}")
+        print(f"   원본: {raw_full_text[:100]}...")
+        print(f"   전처리 후: {final_text[:100]}...")
+        
+        # 4. 텍스트를 임베딩 벡터로 변환 (BGE-M3 사용)
+        #    검색 시와 동일한 방식으로 임베딩 생성
+        embedding_vector = create_embedding_vector(final_text)
         
         # 4. FAISS 인덱스에 벡터 추가 (스레드 안전하게 처리)
         with _faiss_lock:
@@ -333,7 +439,6 @@ def create_embeddings_batch():
     Spring에서 받는 것:
     - items: 아이템 리스트 (각 아이템은 다음 필드 포함)
       - item_id: MySQL 분실물 ID (필수)
-      - item_name: 분실물 제목 (필수) - 예: "분홍색 지갑"
       - description: 사용자가 입력한 분실물 설명 (선택)
       - image_url: 이미지 URL (선택)
       - image: 이미지 파일 (image_url이 없을 경우, 선택)
@@ -370,7 +475,6 @@ def create_embeddings_batch():
         def process_item(item):
             """단일 아이템 처리"""
             item_id = item.get('item_id')
-            item_name = item.get('item_name', '')  # 분실물 제목 추가
             raw_description = item.get('description', '')
             image_url = item.get('image_url', '')
             
@@ -401,29 +505,16 @@ def create_embeddings_batch():
                             if len(image_bytes) == 0:
                                 raise ValueError("이미지 파일이 비어있음")
                             image_description = describe_image_with_llava(image_bytes)
-                            # 디버깅: 이미지 캡셔닝 성공 로그 (처음 10개만)
-                            if int(item_id) <= 10:
-                                print(f"✅ 이미지 캡셔닝 성공 (item_id={item_id}): '{image_description[:100]}'")
                             break  # 성공 시 루프 종료
                         except Exception as e:
                             if attempt == max_retries - 1:
                                 print(f"⚠️ 이미지 다운로드/캡셔닝 실패 (item_id={item_id}, 시도 {attempt+1}/{max_retries}): {e}")
-                                # 디버깅: 이미지 캡셔닝 실패 로그 (처음 10개만)
-                                if int(item_id) <= 10:
-                                    print(f"   이미지 URL: {image_url}")
                             else:
                                 time.sleep(0.5 * (attempt + 1))  # 지수 백오프
                             # 마지막 시도 실패 시 텍스트로 진행
-                else:
-                    # 디버깅: 이미지 URL이 없는 경우 (처음 10개만)
-                    if int(item_id) <= 10:
-                        print(f"⚠️ 이미지 URL 없음 (item_id={item_id})")
                 
-                # 2. 분실물 제목 + 이미지 묘사 + 사용자 설명 결합
+                # 2. 텍스트 결합 및 전처리
                 parts = []
-                # 분실물 제목을 가장 먼저 추가 (검색 시 가장 중요)
-                if item_name and item_name.strip():
-                    parts.append(item_name.strip())
                 if image_description:
                     parts.append(image_description)
                 if raw_description and raw_description.strip():
@@ -437,26 +528,16 @@ def create_embeddings_batch():
                     }
                 
                 raw_full_text = " ".join(parts).strip()
-                
-                # 디버깅: 임베딩에 포함될 텍스트 로그 출력 (처음 10개만)
-                if int(item_id) <= 10:
-                    print(f"📝 [임베딩 디버그] item_id={item_id}")
-                    print(f"   - 제목: '{item_name}'")
-                    print(f"   - 이미지 캡셔닝: '{image_description[:100] if image_description else '(없음)'}'")
-                    print(f"   - 설명: '{raw_description[:100] if raw_description else '(없음)'}'")
-                    print(f"   - 결합된 텍스트 (전처리 전): '{raw_full_text[:200]}'")
-                
-                final_text = preprocess_text(raw_full_text)
+                final_text = preprocess_text(
+                    raw_full_text,
+                    use_typo_correction=True,
+                    optimize_for_search=True
+                )
                 if not final_text or len(final_text.strip()) == 0:
                     final_text = raw_full_text.strip()
                 
-                # 디버깅: 전처리 후 텍스트 (처음 10개만)
-                if int(item_id) <= 10:
-                    print(f"   - 전처리 후 텍스트: '{final_text[:200]}'")
-                    print(f"   - 최종 임베딩 텍스트 길이: {len(final_text)}")
-                
-                # 3. 임베딩 벡터 생성 (저장 시이므로 is_query=False)
-                embedding_vector = create_embedding_vector(final_text, is_query=False)
+                # 3. 임베딩 벡터 생성 (캐시 활용)
+                embedding_vector = create_embedding_vector(final_text, use_cache=True)
                 
                 # 4. FAISS 인덱스에 벡터 추가 (스레드 안전하게 처리)
                 faiss_idx = None
@@ -538,13 +619,22 @@ def search_embedding():
         if not raw_query or not raw_query.strip():
             return jsonify({'success': False, 'message': '검색어 필요'}), 400
         
-        # 검색 쿼리 전처리 최소화: 원본 쿼리 우선 사용
-        # BGE-M3는 한국어를 잘 처리하므로 전처리를 최소화하는 것이 성능 향상에 도움됨
-        query = raw_query.strip()
+        # 검색 쿼리 전처리 (리소스 절약: 검색 시에는 맞춤법 교정 선택적)
+        query = preprocess_text(
+            raw_query,
+            use_typo_correction=False,  # 검색 시에는 맞춤법 교정 스킵하여 리소스 절약
+            optimize_for_search=True    # 검색 최적화 적용
+        )
+        if not query:
+            query = raw_query.strip()
         
-        # 전처리는 선택적으로만 적용 (원본이 비어있을 때만)
-        # 맞춤법 교정 모델이 정확한 키워드를 변경할 수 있으므로 검색 시에는 사용하지 않음
         top_k = data.get('top_k', 10)
+        
+        # 검색 쿼리 확장 (동의어 추가로 검색 성능 향상)
+        # 리소스 절약: 사전 기반 확장으로 LLM 없이 빠르게 처리
+        expanded_queries = expand_search_query(query)
+        if len(expanded_queries) > 1:
+            print(f"🔍 검색 쿼리 확장: 원본='{query}', 확장={expanded_queries[:3]}")
         
         if not query:
             return jsonify({'success': False, 'message': '검색어 필요'}), 400
@@ -557,42 +647,102 @@ def search_embedding():
         if faiss_index is None or faiss_index.ntotal == 0:
             return jsonify({'success': True, 'item_ids': []})
         
-        # 1. 검색어를 임베딩 벡터로 변환 (BGE-M3 사용)
-        # BGE-M3는 instruction을 활용하면 검색 성능이 향상됨
-        # "이 문장을 검색합니다: " 프리픽스 추가
-        query_for_embedding = f"이 문장을 검색합니다: {query}"
-        query_vector = create_embedding_vector(query_for_embedding, is_query=True)
+        # 1. 검색어를 임베딩 벡터로 변환 (BGE-M3 사용, 캐시 활용)
+        #    확장된 쿼리들을 배치로 처리하여 리소스 효율 향상
+        if len(expanded_queries) > 1:
+            # 여러 쿼리를 배치로 임베딩 (리소스 효율적)
+            query_vectors = create_embedding_vectors_batch(expanded_queries, use_cache=True)
+            # 원본 쿼리 벡터를 메인으로 사용
+            query_vector = query_vectors[0]
+        else:
+            query_vector = create_embedding_vector(query, use_cache=True)
         
         # 2. FAISS에서 코사인 유사도 기반 Top-K 검색
-        k = min(top_k, faiss_index.ntotal)
+        k = min(top_k * 2, faiss_index.ntotal)  # 더 많이 가져와서 재정렬 여유 확보
         
         # HNSW 인덱스인 경우 ef_search 파라미터 설정 (정확도와 성능 균형)
-        # 고정값 사용하여 검색 결과 일관성 유지
         if hasattr(faiss_index, 'hnsw'):
-            # 고정값 사용 (검색마다 변경하지 않음)
-            faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
+            # k보다 충분히 큰 값으로 설정하여 정확도 향상
+            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 2)  # 3 -> 2로 줄여서 리소스 절약
         
         # 검색 실행
         distances, indices = faiss_index.search(np.array([query_vector]), k)
-        debug_pairs = [
-            (int(idx), float(dist))
-            for idx, dist in zip(indices[0], distances[0])
-            if idx != -1
-        ]
-        print(f"📈 검색 디버그: query='{query[:50]}', 결과={debug_pairs}")
         
-        # 3. FAISS 인덱스 번호 → MySQL item_id 변환
-        #    유사도 순서대로 정렬된 상태 유지
-        item_ids = []
-        scores = []
-        for idx, dist in zip(indices[0], distances[0]):
-            if int(idx) != -1 and int(idx) in id_mapping:
-                item_ids.append(id_mapping[int(idx)])
-                scores.append(float(dist))  # IndexFlatIP이므로 내적 값 (높을수록 유사)
+        # 확장된 쿼리로 추가 검색 (검색 성능 향상)
+        if len(expanded_queries) > 1 and len(query_vectors) > 1:
+            all_candidates = {}  # item_id -> 최고 점수
+            for qv in query_vectors[1:]:  # 원본 제외한 확장 쿼리들
+                dists, idxs = faiss_index.search(np.array([qv]), k)
+                for idx, dist in zip(idxs[0], dists[0]):
+                    if int(idx) != -1 and int(idx) in id_mapping:
+                        item_id = id_mapping[int(idx)]
+                        # 여러 쿼리 중 최고 점수 유지
+                        if item_id not in all_candidates or dist > all_candidates[item_id]:
+                            all_candidates[item_id] = dist
+            
+            # 원본 쿼리 결과와 병합
+            for idx, dist in zip(indices[0], distances[0]):
+                if int(idx) != -1 and int(idx) in id_mapping:
+                    item_id = id_mapping[int(idx)]
+                    if item_id not in all_candidates or dist > all_candidates[item_id]:
+                        all_candidates[item_id] = dist
+            
+            # 점수 순으로 정렬 및 유사도 임계값 필터링
+            sorted_candidates = sorted(all_candidates.items(), key=lambda x: x[1], reverse=True)
+            # 유사도 임계값 이상인 결과만 필터링
+            filtered_candidates = [
+                (item_id, score) for item_id, score in sorted_candidates
+                if score >= SIMILARITY_THRESHOLD
+            ]
+            
+            # 최소 결과 수 보장 (임계값을 만족하는 결과가 적어도 최소 개수는 반환)
+            if len(filtered_candidates) < MIN_RESULTS_TO_RETURN and len(sorted_candidates) > 0:
+                # 임계값을 만족하는 결과가 적으면 상위 결과를 포함 (최소 개수 보장)
+                filtered_candidates = sorted_candidates[:max(MIN_RESULTS_TO_RETURN, top_k)]
+            
+            item_ids = [item_id for item_id, _ in filtered_candidates[:top_k]]
+            scores = [score for _, score in filtered_candidates[:top_k]]
+        else:
+            # 단일 쿼리 검색
+            debug_pairs = [
+                (int(idx), float(dist))
+                for idx, dist in zip(indices[0], distances[0])
+                if idx != -1
+            ]
+            print(f"📈 검색 디버그: query='{query[:50]}', 결과={debug_pairs}")
+            
+            # FAISS 인덱스 번호 → MySQL item_id 변환 및 유사도 임계값 필터링
+            item_ids = []
+            scores = []
+            for idx, dist in zip(indices[0], distances[0]):
+                if int(idx) != -1 and int(idx) in id_mapping:
+                    score = float(dist)  # IndexFlatIP이므로 내적 값 (높을수록 유사)
+                    # 유사도 임계값 이상인 결과만 포함
+                    if score >= SIMILARITY_THRESHOLD:
+                        item_ids.append(id_mapping[int(idx)])
+                        scores.append(score)
+            
+            # 최소 결과 수 보장 (임계값을 만족하는 결과가 적어도 최소 개수는 반환)
+            if len(item_ids) < MIN_RESULTS_TO_RETURN:
+                # 임계값 미만이어도 상위 결과를 포함 (최소 개수 보장)
+                item_ids = []
+                scores = []
+                for idx, dist in zip(indices[0], distances[0]):
+                    if int(idx) != -1 and int(idx) in id_mapping:
+                        item_ids.append(id_mapping[int(idx)])
+                        scores.append(float(dist))
+                        if len(item_ids) >= MIN_RESULTS_TO_RETURN:
+                            break
+            
+            # top_k만큼만 반환
+            item_ids = item_ids[:top_k]
+            scores = scores[:top_k]
         
         # 디버깅: 유사도 점수와 함께 출력
         result_pairs = list(zip(item_ids[:10], scores[:10]))
+        filtered_count = len([s for s in scores if s >= SIMILARITY_THRESHOLD])
         print(f"🔍 자연어 검색 완료: query='{query[:30]}...', top_k={top_k}, 결과={len(item_ids)}개")
+        print(f"📊 유사도 임계값: {SIMILARITY_THRESHOLD}, 임계값 이상: {filtered_count}개")
         print(f"📊 상위 10개 유사도 점수: {result_pairs}")
         
         return jsonify({
@@ -652,23 +802,45 @@ def search_by_image():
         # 2. FAISS에서 유사도 검색
         k = min(top_k, faiss_index.ntotal)
         
-        # HNSW 인덱스인 경우 ef_search 파라미터 설정 (고정값 사용)
+        # HNSW 인덱스인 경우 ef_search 파라미터 설정
         if hasattr(faiss_index, 'hnsw'):
-            faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
+            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 2)
         
         distances, indices = faiss_index.search(np.array([query_vector]), k)
         
-        # 3. FAISS 인덱스 번호 → MySQL item_id 변환
+        # 3. FAISS 인덱스 번호 → MySQL item_id 변환 및 유사도 임계값 필터링
         item_ids = []
-        for idx in indices[0]:
-            if int(idx) in id_mapping:
-                item_ids.append(id_mapping[int(idx)])
+        scores = []
+        for idx, dist in zip(indices[0], distances[0]):
+            if int(idx) != -1 and int(idx) in id_mapping:
+                score = float(dist)
+                # 유사도 임계값 이상인 결과만 포함
+                if score >= SIMILARITY_THRESHOLD:
+                    item_ids.append(id_mapping[int(idx)])
+                    scores.append(score)
         
-        print(f"🔍 이미지 검색 완료: top_k={top_k}, 결과={len(item_ids)}개")
+        # 최소 결과 수 보장
+        if len(item_ids) < MIN_RESULTS_TO_RETURN:
+            item_ids = []
+            scores = []
+            for idx, dist in zip(indices[0], distances[0]):
+                if int(idx) != -1 and int(idx) in id_mapping:
+                    item_ids.append(id_mapping[int(idx)])
+                    scores.append(float(dist))
+                    if len(item_ids) >= MIN_RESULTS_TO_RETURN:
+                        break
+        
+        # top_k만큼만 반환
+        item_ids = item_ids[:top_k]
+        scores = scores[:top_k] if scores else []
+        
+        filtered_count = len([s for s in scores if s >= SIMILARITY_THRESHOLD]) if scores else len(item_ids)
+        print(f"🔍 이미지 검색 완료: top_k={top_k}, 결과={len(item_ids)}개, 임계값 이상: {filtered_count}개")
         
         return jsonify({
             'success': True,
-            'item_ids': item_ids
+            'item_ids': item_ids,
+            'scores': scores  # 유사도 점수도 함께 반환
         })
         
     except Exception as e:
@@ -715,9 +887,16 @@ def search_with_filters():
         raw_query = data.get('query', '')
         if not raw_query or not raw_query.strip():
             return jsonify({'success': False, 'message': '검색어 필요'}), 400
-        query = preprocess_text(raw_query)
+        
+        # 검색 쿼리 전처리 (리소스 절약)
+        query = preprocess_text(
+            raw_query,
+            use_typo_correction=False,  # 검색 시에는 맞춤법 교정 스킵
+            optimize_for_search=True
+        )
         if not query:
             query = raw_query.strip()
+        
         top_k = data.get('top_k', 10)
         filters = data.get('filters', {})
         weights = data.get('weights', {
@@ -736,14 +915,13 @@ def search_with_filters():
         if faiss_index is None or faiss_index.ntotal == 0:
             return jsonify({'success': True, 'item_ids': []})
         
-        # 1. 기본 시맨틱 검색
-        query_for_embedding = f"이 문장을 검색합니다: {query}"
-        query_vector = create_embedding_vector(query_for_embedding, is_query=True)
+        # 1. 기본 시맨틱 검색 (캐시 활용)
+        query_vector = create_embedding_vector(query, use_cache=True)
         k = min(top_k * 3, faiss_index.ntotal)  # 더 많이 가져와서 필터링
         
-        # HNSW 인덱스인 경우 ef_search 파라미터 설정 (고정값 사용)
+        # HNSW 인덱스인 경우 ef_search 파라미터 설정
         if hasattr(faiss_index, 'hnsw'):
-            faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
+            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 2)
         
         distances, indices = faiss_index.search(np.array([query_vector]), k)
         
