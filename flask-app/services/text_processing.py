@@ -1,4 +1,7 @@
 import re
+import threading
+import fcntl
+import os
 from functools import lru_cache
 from typing import Optional, List
 
@@ -107,18 +110,92 @@ KEYWORD_EXPANSION = {
 }
 
 
-@lru_cache(maxsize=1)
+# 전역 락 및 모델 캐시 (워커 간 공유를 위한 전역 변수)
+_tokenizer_lock = threading.Lock()
+_model_lock = threading.Lock()
+_tokenizer_cache = None
+_model_cache = None
+
 def _load_tokenizer() -> T5Tokenizer:
-    return T5Tokenizer.from_pretrained(MODEL_NAME)
+    """토크나이저 로드 (파일 락으로 중복 다운로드 방지)"""
+    global _tokenizer_cache
+    
+    if _tokenizer_cache is not None:
+        return _tokenizer_cache
+    
+    with _tokenizer_lock:
+        # 이중 체크
+        if _tokenizer_cache is not None:
+            return _tokenizer_cache
+        
+        _tokenizer_cache = T5Tokenizer.from_pretrained(MODEL_NAME)
+        return _tokenizer_cache
 
 
-@lru_cache(maxsize=1)
 def _load_model() -> T5ForConditionalGeneration:
-    model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.eval()
-    return model
+    """모델 로드 (파일 락으로 중복 다운로드 및 GPU 메모리 충돌 방지)"""
+    global _model_cache
+    
+    if _model_cache is not None:
+        return _model_cache
+    
+    # 파일 락 경로 (워커 간 공유)
+    lock_file_path = os.path.join("/tmp", ".typo_model_load_lock")
+    os.makedirs(os.path.dirname(lock_file_path), exist_ok=True)
+    
+    with _model_lock:
+        # 이중 체크
+        if _model_cache is not None:
+            return _model_cache
+        
+        # 파일 락으로 다른 워커와의 충돌 방지
+        with open(lock_file_path, 'w') as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            
+            try:
+                # 다시 확인 (파일 락 획득 후)
+                if _model_cache is not None:
+                    return _model_cache
+                
+                print(f"📥 맞춤법 교정 모델 로드 시작: {MODEL_NAME}")
+                model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME)
+                
+                # GPU 사용 가능 여부 확인 및 메모리 체크
+                if torch.cuda.is_available():
+                    gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                    allocated = torch.cuda.memory_allocated(0) / (1024**3)
+                    free = gpu_memory - allocated
+                    
+                    # GPU 메모리가 충분하면 GPU 사용, 아니면 CPU 사용
+                    if free > 1.0:  # 최소 1GB 필요
+                        device = torch.device("cuda")
+                        print(f"💾 GPU 사용: 여유 {free:.2f}GB")
+                    else:
+                        device = torch.device("cpu")
+                        print(f"⚠️ GPU 메모리 부족 ({free:.2f}GB), CPU 사용")
+                else:
+                    device = torch.device("cpu")
+                    print("💾 CPU 사용 (GPU 없음)")
+                
+                # 모델을 디바이스로 이동 (to_empty 사용하여 meta tensor 문제 해결)
+                try:
+                    model = model.to(device)
+                except RuntimeError as e:
+                    if "meta tensor" in str(e).lower():
+                        # meta tensor 문제 해결
+                        from torch.nn import Module
+                        model = model.to_empty(device=device)
+                        model.load_state_dict(model.state_dict(), strict=False)
+                    else:
+                        raise
+                
+                model.eval()
+                _model_cache = model
+                print(f"✅ 맞춤법 교정 모델 로드 완료")
+                return model
+                
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def preprocess_text(

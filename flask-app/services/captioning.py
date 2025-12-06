@@ -1,6 +1,8 @@
 import io
 import os
 import shutil
+import threading
+import fcntl
 from functools import lru_cache
 from typing import Optional
 
@@ -77,53 +79,121 @@ def _check_disk_space(min_free_gb: float = 5.0):
         return True  # 실패해도 계속 진행
 
 
-@lru_cache(maxsize=1)
+# 전역 락 및 모델 캐시 (워커 간 공유를 위한 전역 변수)
+_model_lock = threading.Lock()
+_processor_cache = {}
+_model_cache = {}
+
 def _load_processor(model_id: str = DEFAULT_MODEL_ID) -> AutoProcessor:
-    return AutoProcessor.from_pretrained(
-        model_id, 
-        trust_remote_code=True,
-        use_fast=False,  # fast processor 경고 방지
-    )
-
-
-@lru_cache(maxsize=1)
-def _load_model(model_id: str = DEFAULT_MODEL_ID):
-    # 모델 다운로드 전 디스크 공간 확인 (약 4GB 필요)
-    _check_disk_space(min_free_gb=5.0)
+    """프로세서 로드 (파일 락으로 중복 다운로드 방지)"""
+    if model_id in _processor_cache:
+        return _processor_cache[model_id]
     
-    quantization = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-    )
-    # Qwen2.5-VL 모델 로드
-    # trust_remote_code=True로 모델이 자동으로 올바른 클래스를 선택
-    print(f"📥 Qwen2.5-VL 모델 다운로드 시작: {model_id}")
-    try:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_id,
-            device_map="auto",
+    with _model_lock:
+        # 이중 체크 (락 획득 후 다시 확인)
+        if model_id in _processor_cache:
+            return _processor_cache[model_id]
+        
+        processor = AutoProcessor.from_pretrained(
+            model_id, 
             trust_remote_code=True,
-            quantization_config=quantization,
+            use_fast=False,  # fast processor 경고 방지
         )
-    except Exception as e:
-        # fallback: AutoModel 사용 (trust_remote_code로 자동 감지)
-        from transformers import AutoModel
-        model = AutoModel.from_pretrained(
-            model_id,
-            device_map="auto",
-            trust_remote_code=True,
-            quantization_config=quantization,
-        )
-        # generate 메서드가 있는지 확인
-        if not hasattr(model, 'generate'):
-            raise RuntimeError(
-                f"로드된 모델이 generate 메서드를 지원하지 않습니다. "
-                f"transformers 버전을 4.51.3 이상으로 업데이트하세요. 원본 에러: {e}"
-            )
-    model.eval()
-    return model
+        _processor_cache[model_id] = processor
+        return processor
+
+
+def _load_model(model_id: str = DEFAULT_MODEL_ID):
+    """모델 로드 (파일 락으로 중복 다운로드 및 GPU 메모리 충돌 방지)"""
+    if model_id in _model_cache:
+        return _model_cache[model_id]
+    
+    # 파일 락 경로 (워커 간 공유)
+    lock_file_path = os.path.join(os.getenv("HF_HOME", "/tmp"), ".model_load_lock")
+    os.makedirs(os.path.dirname(lock_file_path), exist_ok=True)
+    
+    with _model_lock:
+        # 이중 체크 (락 획득 후 다시 확인)
+        if model_id in _model_cache:
+            return _model_cache[model_id]
+        
+        # 파일 락으로 다른 워커와의 충돌 방지
+        with open(lock_file_path, 'w') as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            
+            try:
+                # 다시 확인 (파일 락 획득 후)
+                if model_id in _model_cache:
+                    return _model_cache[model_id]
+                
+                # 모델 다운로드 전 디스크 공간 확인 (약 4GB 필요)
+                _check_disk_space(min_free_gb=5.0)
+                
+                # GPU 메모리 확인
+                if torch.cuda.is_available():
+                    gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                    allocated = torch.cuda.memory_allocated(0) / (1024**3)
+                    free = gpu_memory - allocated
+                    print(f"💾 GPU 메모리 상태: 전체 {gpu_memory:.2f}GB, 사용 {allocated:.2f}GB, 여유 {free:.2f}GB")
+                    
+                    if free < 2.0:  # 최소 2GB 필요
+                        print(f"⚠️ GPU 메모리 부족 ({free:.2f}GB < 2GB). 기존 모델 정리 중...")
+                        torch.cuda.empty_cache()
+                        free = torch.cuda.get_device_properties(0).total_memory / (1024**3) - torch.cuda.memory_allocated(0) / (1024**3)
+                        print(f"   정리 후 여유: {free:.2f}GB")
+                
+                quantization = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.float16,
+                )
+                
+                # Qwen2.5-VL 모델 로드
+                print(f"📥 Qwen2.5-VL 모델 다운로드 시작: {model_id}")
+                try:
+                    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        model_id,
+                        device_map="auto",
+                        trust_remote_code=True,
+                        quantization_config=quantization,
+                        low_cpu_mem_usage=True,  # CPU 메모리 사용량 최소화
+                    )
+                except Exception as e:
+                    # GPU 메모리 부족 시 CPU 오프로드 시도
+                    if "out of memory" in str(e).lower() or "CUDA" in str(e):
+                        print(f"⚠️ GPU 메모리 부족, CPU 오프로드 시도: {e}")
+                        quantization.llm_int8_enable_fp32_cpu_offload = True
+                        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                            model_id,
+                            device_map="auto",
+                            trust_remote_code=True,
+                            quantization_config=quantization,
+                            low_cpu_mem_usage=True,
+                        )
+                    else:
+                        # fallback: AutoModel 사용
+                        from transformers import AutoModel
+                        model = AutoModel.from_pretrained(
+                            model_id,
+                            device_map="auto",
+                            trust_remote_code=True,
+                            quantization_config=quantization,
+                            low_cpu_mem_usage=True,
+                        )
+                        if not hasattr(model, 'generate'):
+                            raise RuntimeError(
+                                f"로드된 모델이 generate 메서드를 지원하지 않습니다. "
+                                f"transformers 버전을 4.51.3 이상으로 업데이트하세요. 원본 에러: {e}"
+                            )
+                
+                model.eval()
+                _model_cache[model_id] = model
+                print(f"✅ 모델 로드 완료: {model_id}")
+                return model
+                
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def generate_caption(

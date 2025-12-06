@@ -12,7 +12,7 @@ services:
       EMBEDDING_MODEL_NAME: "BAAI/bge-m3"
       EMBEDDING_DIMENSION: "1024"
       FAISS_STORAGE_DIR: "/app/faiss-data"
-      GUNICORN_WORKERS: "2"  # Qwen 7B 모델 리소스 고려하여 2개로 감소 (메모리 절약)
+      GUNICORN_WORKERS: "1"  # GPU 메모리 제한으로 1개 워커만 사용 (각 워커가 독립적으로 모델 로드)
       # HuggingFace 모델 캐시를 볼륨으로 마운트하여 컨테이너 내부 디스크 공간 절약
       HF_HOME: "/app/hf-cache"
       TRANSFORMERS_CACHE: "/app/hf-cache"
