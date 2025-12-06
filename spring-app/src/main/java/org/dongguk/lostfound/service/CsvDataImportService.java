@@ -12,6 +12,8 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -38,6 +40,7 @@ public class CsvDataImportService {
     private final PasswordEncoder passwordEncoder;
     private final FlaskApiService flaskApiService;
     private final ThreadPoolTaskExecutor embeddingExecutor;
+    private final TransactionTemplate transactionTemplate;
     
     public CsvDataImportService(
             CustodyLocationRepository custodyLocationRepository,
@@ -45,13 +48,15 @@ public class CsvDataImportService {
             LostItemRepository lostItemRepository,
             PasswordEncoder passwordEncoder,
             FlaskApiService flaskApiService,
-            @Qualifier("embeddingExecutor") ThreadPoolTaskExecutor embeddingExecutor) {
+            @Qualifier("embeddingExecutor") ThreadPoolTaskExecutor embeddingExecutor,
+            PlatformTransactionManager transactionManager) {
         this.custodyLocationRepository = custodyLocationRepository;
         this.userRepository = userRepository;
         this.lostItemRepository = lostItemRepository;
         this.passwordEncoder = passwordEncoder;
         this.flaskApiService = flaskApiService;
         this.embeddingExecutor = embeddingExecutor;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
     
     private static final String DEFAULT_PASSWORD = "1234";
@@ -269,9 +274,8 @@ public class CsvDataImportService {
                         custodyUserMap.put(custodyPlace, user);
                     }
                     
-                    // 보관소 위치 정보 가져오기 (위도, 경도)
-                    CustodyLocation custodyLocation = custodyLocationRepository.findByName(custodyPlace)
-                        .orElse(null);
+                    // 보관소 위치 정보 가져오기 (위도, 경도) - 트랜잭션 컨텍스트 내에서 조회
+                    CustodyLocation custodyLocation = getCustodyLocation(custodyPlace);
                     
                     Double latitude = custodyLocation != null ? custodyLocation.getLatitude() : null;
                     Double longitude = custodyLocation != null ? custodyLocation.getLongitude() : null;
@@ -352,16 +356,34 @@ public class CsvDataImportService {
     /**
      * User를 가져오거나 없으면 생성
      * 트랜잭션 컨텍스트 내에서 실행되어 connection leak 방지
+     * 읽기 전용 트랜잭션으로 먼저 조회하고, 없을 경우 TransactionTemplate을 사용하여
+     * 명시적으로 새로운 트랜잭션에서 생성 (같은 클래스 내 호출 시 프록시 문제 해결)
      */
-    @Transactional
+    @Transactional(readOnly = true)
     public User getOrCreateUser(String custodyPlace) {
-        return userRepository.findByLoginId(custodyPlace)
-            .orElseGet(() -> {
-                // User가 없으면 생성
-                String encodedPassword = passwordEncoder.encode(DEFAULT_PASSWORD);
-                User newUser = User.create(custodyPlace, encodedPassword);
-                return userRepository.save(newUser);
-            });
+        // 먼저 조회 시도
+        Optional<User> existingUser = userRepository.findByLoginId(custodyPlace);
+        if (existingUser.isPresent()) {
+            return existingUser.get();
+        }
+        
+        // 없으면 TransactionTemplate을 사용하여 명시적으로 새로운 트랜잭션에서 생성
+        // 같은 클래스 내 호출 시에도 트랜잭션이 제대로 작동하도록 함
+        return transactionTemplate.execute(status -> {
+            String encodedPassword = passwordEncoder.encode(DEFAULT_PASSWORD);
+            User newUser = User.create(custodyPlace, encodedPassword);
+            return userRepository.save(newUser);
+        });
+    }
+    
+    /**
+     * 보관소 위치 정보 조회
+     * 트랜잭션 컨텍스트 내에서 실행되어 connection leak 방지
+     * REQUIRES_NEW 제거: 읽기 전용 작업이므로 일반 트랜잭션으로 충분하며, connection leak 방지
+     */
+    @Transactional(readOnly = true)
+    public CustodyLocation getCustodyLocation(String custodyPlace) {
+        return custodyLocationRepository.findByName(custodyPlace).orElse(null);
     }
     
     /**
