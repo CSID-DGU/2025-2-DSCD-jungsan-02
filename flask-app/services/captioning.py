@@ -1,5 +1,6 @@
 import io
 import os
+import shutil
 from functools import lru_cache
 from typing import Optional
 
@@ -31,6 +32,51 @@ DEFAULT_MODEL_ID = os.getenv(
 )
 
 
+def _check_disk_space(min_free_gb: float = 5.0):
+    """모델 다운로드 전 디스크 공간 확인 및 정리"""
+    try:
+        stat = shutil.disk_usage("/")
+        free_gb = stat.free / (1024**3)
+        
+        if free_gb < min_free_gb:
+            print(f"⚠️ 디스크 공간 부족 ({free_gb:.2f}GB). 정리 중...")
+            
+            # 임시 파일 정리
+            for tmp_dir in ["/tmp", "/var/tmp"]:
+                if os.path.exists(tmp_dir):
+                    try:
+                        for item in os.listdir(tmp_dir):
+                            item_path = os.path.join(tmp_dir, item)
+                            try:
+                                if os.path.isfile(item_path):
+                                    os.remove(item_path)
+                                elif os.path.isdir(item_path):
+                                    shutil.rmtree(item_path)
+                            except:
+                                pass
+                    except:
+                        pass
+            
+            # 다시 확인
+            stat = shutil.disk_usage("/")
+            free_gb_after = stat.free / (1024**3)
+            print(f"✅ 정리 완료: 여유 공간 {free_gb_after:.2f}GB")
+            
+            if free_gb_after < min_free_gb:
+                raise RuntimeError(
+                    f"디스크 공간이 부족합니다. "
+                    f"필요: {min_free_gb}GB 이상, 현재: {free_gb_after:.2f}GB. "
+                    f"볼륨 마운트를 확인하거나 호스트 디스크 공간을 확보하세요."
+                )
+        
+        return True
+    except RuntimeError:
+        raise
+    except Exception as e:
+        print(f"⚠️ 디스크 공간 확인 실패: {e}")
+        return True  # 실패해도 계속 진행
+
+
 @lru_cache(maxsize=1)
 def _load_processor(model_id: str = DEFAULT_MODEL_ID) -> AutoProcessor:
     return AutoProcessor.from_pretrained(
@@ -42,6 +88,9 @@ def _load_processor(model_id: str = DEFAULT_MODEL_ID) -> AutoProcessor:
 
 @lru_cache(maxsize=1)
 def _load_model(model_id: str = DEFAULT_MODEL_ID):
+    # 모델 다운로드 전 디스크 공간 확인 (약 4GB 필요)
+    _check_disk_space(min_free_gb=5.0)
+    
     quantization = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
@@ -50,6 +99,7 @@ def _load_model(model_id: str = DEFAULT_MODEL_ID):
     )
     # Qwen2.5-VL 모델 로드
     # trust_remote_code=True로 모델이 자동으로 올바른 클래스를 선택
+    print(f"📥 Qwen2.5-VL 모델 다운로드 시작: {model_id}")
     try:
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_id,

@@ -15,6 +15,8 @@ import json
 import time
 from functools import lru_cache
 import hashlib
+import shutil
+import subprocess
 
 from services.captioning import generate_caption
 from services.text_processing import preprocess_text, expand_search_query
@@ -52,6 +54,67 @@ _model_loaded = False
 _faiss_lock = threading.Lock()  # FAISS 인덱스 접근 동기화
 _pending_save_count = 0  # 저장 대기 중인 벡터 개수
 _save_batch_size = 10  # N개마다 저장 (개별 API용)
+
+def check_and_free_disk_space(min_free_gb: float = 5.0):
+    """디스크 공간 확인 및 필요시 정리"""
+    try:
+        # 디스크 사용량 확인
+        stat = shutil.disk_usage("/")
+        free_gb = stat.free / (1024**3)
+        total_gb = stat.total / (1024**3)
+        used_percent = (stat.used / stat.total) * 100
+        
+        print(f"💾 디스크 상태: 전체 {total_gb:.2f}GB, 사용 {used_percent:.1f}%, 여유 {free_gb:.2f}GB")
+        
+        if free_gb < min_free_gb:
+            print(f"⚠️ 디스크 공간 부족 ({free_gb:.2f}GB < {min_free_gb}GB). 정리 시작...")
+            
+            # 임시 파일 정리
+            for tmp_dir in ["/tmp", "/var/tmp"]:
+                if os.path.exists(tmp_dir):
+                    try:
+                        for item in os.listdir(tmp_dir):
+                            item_path = os.path.join(tmp_dir, item)
+                            try:
+                                if os.path.isfile(item_path):
+                                    os.remove(item_path)
+                                elif os.path.isdir(item_path):
+                                    shutil.rmtree(item_path)
+                            except Exception as e:
+                                pass  # 권한 문제 등 무시
+                    except Exception as e:
+                        pass
+            
+            # pip 캐시 정리
+            pip_cache = os.path.expanduser("~/.cache/pip")
+            if os.path.exists(pip_cache):
+                try:
+                    shutil.rmtree(pip_cache)
+                except:
+                    pass
+            
+            # Python 캐시 정리
+            for root, dirs, files in os.walk("/usr/local/lib/python3.10"):
+                for d in dirs:
+                    if d == "__pycache__":
+                        try:
+                            shutil.rmtree(os.path.join(root, d))
+                        except:
+                            pass
+            
+            # 다시 확인
+            stat = shutil.disk_usage("/")
+            free_gb_after = stat.free / (1024**3)
+            print(f"✅ 정리 완료: 여유 공간 {free_gb_after:.2f}GB")
+            
+            if free_gb_after < min_free_gb:
+                print(f"❌ 경고: 여전히 디스크 공간이 부족합니다 ({free_gb_after:.2f}GB)")
+                return False
+        
+        return True
+    except Exception as e:
+        print(f"⚠️ 디스크 공간 확인 실패: {e}")
+        return True  # 실패해도 계속 진행
 
 def initialize_faiss():
     """FAISS 인덱스 초기화 또는 로드 (한 번만 실행)
@@ -120,6 +183,8 @@ def load_embedding_model() -> SentenceTransformer:
     """SentenceTransformer 모델을 1회 로드"""
     global embedding_model, _model_loaded
     if embedding_model is None or not _model_loaded:
+        # 모델 로드 전 디스크 공간 확인
+        check_and_free_disk_space(min_free_gb=2.0)
         print(f"📦 BGE 모델 로드: {EMBEDDING_MODEL_NAME} (device={embedding_device})")
         embedding_model = SentenceTransformer(
             EMBEDDING_MODEL_NAME,

@@ -26,7 +26,13 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip cache purge && \
     rm -rf /root/.cache/pip /root/.cache/huggingface /tmp/* /var/tmp/* && \
     find /usr/local/lib/python3.*/dist-packages -type d -name __pycache__ -exec rm -r {} + 2>/dev/null || true && \
-    find /usr/local/lib/python3.*/dist-packages -name "*.pyc" -delete 2>/dev/null || true
+    find /usr/local/lib/python3.*/dist-packages -name "*.pyc" -delete 2>/dev/null || true && \
+    find /usr/local/lib/python3.*/dist-packages -name "*.pyo" -delete 2>/dev/null || true && \
+    # CUDA 베이스 이미지에서 불필요한 파일 제거
+    rm -rf /usr/local/cuda/doc 2>/dev/null || true && \
+    rm -rf /usr/local/cuda/samples 2>/dev/null || true && \
+    # 디스크 공간 확인
+    df -h
 
 # 소스 복사
 COPY . .
