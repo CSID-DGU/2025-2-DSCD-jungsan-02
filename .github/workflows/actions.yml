@@ -91,6 +91,7 @@ jobs:
 
       - name: Deploy to server
         uses: appleboy/ssh-action@master
+        timeout: 30m  # 타임아웃 30분으로 증가 (기본값 5분)
         with:
           host: ${{ secrets.HOST_PROD }}
           username: mj
@@ -115,9 +116,33 @@ jobs:
             echo "📊 정리 후 디스크 사용량:"
             df -h
             
-            # 최신 이미지 다운로드
+            # 최신 이미지 다운로드 (타임아웃 및 재시도 로직 추가)
             echo "📥 최신 이미지 다운로드 중..."
-            docker compose pull
+            MAX_RETRIES=3
+            RETRY_DELAY=30  # 재시도 대기 시간 (30초)
+            RETRY_COUNT=0
+            
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              echo "🔄 다운로드 시도 ${RETRY_COUNT}/$MAX_RETRIES..."
+              if timeout 1800 docker compose pull; then  # 30분 타임아웃
+                echo "✅ 이미지 다운로드 성공"
+                break
+              else
+                EXIT_CODE=$?
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                  if [ $EXIT_CODE -eq 124 ]; then
+                    echo "⏱️ 타임아웃 발생, ${RETRY_DELAY}초 후 재시도 (${RETRY_COUNT}/${MAX_RETRIES})..."
+                  else
+                    echo "⚠️ 다운로드 실패 (종료 코드: $EXIT_CODE), ${RETRY_DELAY}초 후 재시도 (${RETRY_COUNT}/${MAX_RETRIES})..."
+                  fi
+                  sleep $RETRY_DELAY
+                else
+                  echo "❌ 이미지 다운로드 최종 실패 (${MAX_RETRIES}회 시도, 종료 코드: $EXIT_CODE)"
+                  exit 1
+                fi
+              fi
+            done
             
             # 컨테이너 시작
             echo "🚀 컨테이너 시작 중..."
