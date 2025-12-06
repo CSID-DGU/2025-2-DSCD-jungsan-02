@@ -50,6 +50,8 @@ embedding_device = "cuda" if torch.cuda.is_available() else "cpu"
 _faiss_initialized = False
 _model_loaded = False
 _faiss_lock = threading.Lock()  # FAISS 인덱스 접근 동기화
+_pending_save_count = 0  # 저장 대기 중인 벡터 개수
+_save_batch_size = 10  # N개마다 저장 (개별 API용)
 
 def initialize_faiss():
     """FAISS 인덱스 초기화 또는 로드 (한 번만 실행)
@@ -364,22 +366,38 @@ def create_embedding():
         if not _faiss_initialized:
             initialize_faiss()
         
-        # 1. 이미지 묘사 생성 (Qwen 기반)
+        # 1. 이미지 묘사 생성 (Qwen 기반) - 혁신적 개선된 프롬프트 사용
         image_description = ""
+        caption_failed = False
         if image_file:
             image_bytes = image_file.read()
             image_description = describe_image_with_llava(image_bytes)
-            if not image_description and raw_description:
-                image_description = raw_description.strip()
-            print(f"🖼️  이미지 분석 완료 (원본): {image_description[:100]}...")
+            if not image_description:
+                caption_failed = True
+                if raw_description:
+                    image_description = raw_description.strip()
+                    print(f"⚠️ 이미지 캡셔닝 실패, 원본 description 사용: {image_description[:150]}...")
+                else:
+                    print(f"⚠️ 이미지 캡셔닝 실패, description 없음")
+            else:
+                print(f"🖼️ 이미지 분석 완료: {image_description[:150]}...")
         
-        # 2. 이미지 묘사 + 사용자 설명 결합 (원본 텍스트로 결합)
-        #    예) "빨간색 가죽 지갑입니다. 신촌역 3번 출구에서 발견했습니다."
+        # 2. 이미지 묘사 + 사용자 설명 결합
+        #    혁신적 개선: 사용자 입력도 검색 최적화 전처리 적용
         parts = []
         if image_description:
             parts.append(image_description)
         if raw_description and raw_description.strip():
-            parts.append(raw_description.strip())
+            # 사용자 입력도 검색 최적화 전처리 적용
+            processed_description = preprocess_text(
+                raw_description.strip(),
+                use_typo_correction=False,  # 사용자 입력은 맞춤법 교정 스킵
+                optimize_for_search=True   # 검색 최적화 적용
+            )
+            if processed_description:
+                parts.append(processed_description)
+            else:
+                parts.append(raw_description.strip())
         
         if not parts:
             return jsonify({'success': False, 'message': '설명 정보가 필요합니다.'}), 400
@@ -408,14 +426,23 @@ def create_embedding():
         embedding_vector = create_embedding_vector(final_text)
         
         # 4. FAISS 인덱스에 벡터 추가 (스레드 안전하게 처리)
+        should_save = False
         with _faiss_lock:
             faiss_index.add(np.array([embedding_vector]))
             faiss_idx = faiss_index.ntotal - 1
             # 5. FAISS 인덱스 번호 ↔ MySQL item_id 매핑 저장
             id_mapping[faiss_idx] = int(item_id)
+            # 저장 빈도 제어: N개마다 저장하여 디스크 I/O 최적화
+            global _pending_save_count
+            _pending_save_count += 1
+            if _pending_save_count >= _save_batch_size:
+                should_save = True
+                _pending_save_count = 0
         
         # 6. FAISS 인덱스 및 매핑 정보를 디스크에 저장 (영속성)
-        save_faiss()
+        # 배치 단위로 저장하여 디스크 I/O 최적화
+        if should_save:
+            save_faiss()
         
         print(f"✅ 임베딩 생성 완료: item_id={item_id}, faiss_idx={faiss_idx}, 벡터 차원={len(embedding_vector)}")
         
@@ -488,6 +515,7 @@ def create_embeddings_batch():
             try:
                 # 1. 이미지 다운로드 및 캡셔닝 (재시도 로직 포함)
                 image_description = ""
+                caption_failed = False
                 if image_url:
                     max_retries = 2
                     for attempt in range(max_retries):
@@ -505,13 +533,22 @@ def create_embeddings_batch():
                             if len(image_bytes) == 0:
                                 raise ValueError("이미지 파일이 비어있음")
                             image_description = describe_image_with_llava(image_bytes)
-                            break  # 성공 시 루프 종료
+                            if image_description:
+                                break  # 성공 시 루프 종료
+                            else:
+                                caption_failed = True
+                                break  # 캡셔닝 실패 시 루프 종료
                         except Exception as e:
                             if attempt == max_retries - 1:
+                                caption_failed = True
                                 print(f"⚠️ 이미지 다운로드/캡셔닝 실패 (item_id={item_id}, 시도 {attempt+1}/{max_retries}): {e}")
                             else:
                                 time.sleep(0.5 * (attempt + 1))  # 지수 백오프
                             # 마지막 시도 실패 시 텍스트로 진행
+                
+                # 캡셔닝 실패 시 원본 description 사용
+                if caption_failed and not image_description and raw_description:
+                    image_description = raw_description.strip()
                 
                 # 2. 텍스트 결합 및 전처리
                 parts = []
@@ -541,6 +578,7 @@ def create_embeddings_batch():
                 
                 # 4. FAISS 인덱스에 벡터 추가 (스레드 안전하게 처리)
                 faiss_idx = None
+                before_count = faiss_index.ntotal
                 with _faiss_lock:
                     faiss_index.add(np.array([embedding_vector]))
                     faiss_idx = faiss_index.ntotal - 1
@@ -572,6 +610,10 @@ def create_embeddings_batch():
                     successful_count += 1
         
         # FAISS 인덱스 및 매핑 정보를 디스크에 저장 (배치 완료 후 한 번만)
+        # 배치 API는 항상 저장하여 데이터 손실 방지
+        with _faiss_lock:
+            global _pending_save_count
+            _pending_save_count = 0  # 배치 저장 시 카운터 리셋
         save_faiss()
         
         print(f"✅ 배치 임베딩 생성 완료: {successful_count}/{len(items)}개 성공")
@@ -631,10 +673,10 @@ def search_embedding():
         top_k = data.get('top_k', 10)
         
         # 검색 쿼리 확장 (동의어 추가로 검색 성능 향상)
-        # 리소스 절약: 사전 기반 확장으로 LLM 없이 빠르게 처리
+        # 혁신적 개선: 더 많은 조합과 확장
         expanded_queries = expand_search_query(query)
         if len(expanded_queries) > 1:
-            print(f"🔍 검색 쿼리 확장: 원본='{query}', 확장={expanded_queries[:3]}")
+            print(f"🔍 검색 쿼리 확장: 원본='{query}', 확장={expanded_queries[:5]} (총 {len(expanded_queries)}개)")
         
         if not query:
             return jsonify({'success': False, 'message': '검색어 필요'}), 400
@@ -649,6 +691,7 @@ def search_embedding():
         
         # 1. 검색어를 임베딩 벡터로 변환 (BGE-M3 사용, 캐시 활용)
         #    확장된 쿼리들을 배치로 처리하여 리소스 효율 향상
+        #    혁신적 개선: 원본 쿼리에 가중치를 더 높게 적용
         if len(expanded_queries) > 1:
             # 여러 쿼리를 배치로 임베딩 (리소스 효율적)
             query_vectors = create_embedding_vectors_batch(expanded_queries, use_cache=True)
@@ -658,7 +701,8 @@ def search_embedding():
             query_vector = create_embedding_vector(query, use_cache=True)
         
         # 2. FAISS에서 코사인 유사도 기반 Top-K 검색
-        k = min(top_k * 2, faiss_index.ntotal)  # 더 많이 가져와서 재정렬 여유 확보
+        #    혁신적 개선: 더 많은 후보를 가져와서 재랭킹
+        k = min(top_k * 3, faiss_index.ntotal)  # 2배 -> 3배로 증가하여 더 많은 후보 확보
         
         # HNSW 인덱스인 경우 ef_search 파라미터 설정 (정확도와 성능 균형)
         if hasattr(faiss_index, 'hnsw'):
@@ -669,31 +713,41 @@ def search_embedding():
         distances, indices = faiss_index.search(np.array([query_vector]), k)
         
         # 확장된 쿼리로 추가 검색 (검색 성능 향상)
+        # 혁신적 개선: 원본 쿼리에 더 높은 가중치 적용
         if len(expanded_queries) > 1 and len(query_vectors) > 1:
-            all_candidates = {}  # item_id -> 최고 점수
+            all_candidates = {}  # item_id -> (최고 점수, 쿼리 타입)
+            query_weights = {'original': 1.0, 'expanded': 0.85}  # 원본 쿼리에 더 높은 가중치
+            
+            # 원본 쿼리 결과 (가중치 1.0)
+            for idx, dist in zip(indices[0], distances[0]):
+                if int(idx) != -1 and int(idx) in id_mapping:
+                    item_id = id_mapping[int(idx)]
+                    score = float(dist) * query_weights['original']  # 원본 쿼리 가중치 적용
+                    if item_id not in all_candidates or score > all_candidates[item_id][0]:
+                        all_candidates[item_id] = (score, 'original')
+            
+            # 확장 쿼리 결과 (가중치 0.85)
             for qv in query_vectors[1:]:  # 원본 제외한 확장 쿼리들
                 dists, idxs = faiss_index.search(np.array([qv]), k)
                 for idx, dist in zip(idxs[0], dists[0]):
                     if int(idx) != -1 and int(idx) in id_mapping:
                         item_id = id_mapping[int(idx)]
-                        score = float(dist)  # numpy float32를 Python float로 변환
-                        # 여러 쿼리 중 최고 점수 유지
-                        if item_id not in all_candidates or score > all_candidates[item_id]:
-                            all_candidates[item_id] = score
-            
-            # 원본 쿼리 결과와 병합
-            for idx, dist in zip(indices[0], distances[0]):
-                if int(idx) != -1 and int(idx) in id_mapping:
-                    item_id = id_mapping[int(idx)]
-                    score = float(dist)  # numpy float32를 Python float로 변환
-                    if item_id not in all_candidates or score > all_candidates[item_id]:
-                        all_candidates[item_id] = score
+                        score = float(dist) * query_weights['expanded']  # 확장 쿼리 가중치 적용
+                        # 원본 쿼리 결과보다 낮으면 업데이트하지 않음 (원본 우선)
+                        if item_id not in all_candidates or score > all_candidates[item_id][0]:
+                            all_candidates[item_id] = (score, 'expanded')
             
             # 점수 순으로 정렬 및 유사도 임계값 필터링
-            sorted_candidates = sorted(all_candidates.items(), key=lambda x: x[1], reverse=True)
+            # 혁신적 개선: 원본 쿼리 매칭 결과를 우선 정렬
+            sorted_candidates = sorted(
+                all_candidates.items(), 
+                key=lambda x: (x[1][1] == 'original', x[1][0]),  # 원본 쿼리 매칭 우선, 그 다음 점수
+                reverse=True
+            )
+            
             # 유사도 임계값 이상인 결과만 필터링
             filtered_candidates = [
-                (item_id, float(score)) for item_id, score in sorted_candidates
+                (item_id, float(score)) for item_id, (score, _) in sorted_candidates
                 if float(score) >= SIMILARITY_THRESHOLD
             ]
             
@@ -701,7 +755,7 @@ def search_embedding():
             if len(filtered_candidates) < MIN_RESULTS_TO_RETURN and len(sorted_candidates) > 0:
                 # 임계값을 만족하는 결과가 적으면 상위 결과를 포함 (최소 개수 보장)
                 filtered_candidates = [
-                    (item_id, float(score)) for item_id, score in sorted_candidates[:max(MIN_RESULTS_TO_RETURN, top_k)]
+                    (item_id, float(score)) for item_id, (score, _) in sorted_candidates[:max(MIN_RESULTS_TO_RETURN, top_k)]
                 ]
             
             item_ids = [item_id for item_id, _ in filtered_candidates[:top_k]]
@@ -747,7 +801,7 @@ def search_embedding():
         filtered_count = len([s for s in scores if s >= SIMILARITY_THRESHOLD])
         print(f"🔍 자연어 검색 완료: query='{query[:30]}...', top_k={top_k}, 결과={len(item_ids)}개")
         print(f"📊 유사도 임계값: {SIMILARITY_THRESHOLD}, 임계값 이상: {filtered_count}개")
-        print(f"📊 상위 10개 유사도 점수: {result_pairs}")
+        print(f"📊 상위 10개 유사도 점수: {result_pairs[:10]}")
         
         # 안전장치: 모든 scores를 Python float로 강제 변환 (numpy 타입 방지)
         safe_scores = []
@@ -971,34 +1025,182 @@ def search_with_filters():
         print(f"❌ 필터링 검색 실패: {str(e)}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
+@app.route('/api/v1/admin/sync-with-db', methods=['POST'])
+def sync_faiss_with_db():
+    """
+    Admin API: DB와 FAISS 동기화
+    
+    DB에는 없지만 FAISS에는 있는 항목들을 찾아서 FAISS에서 삭제합니다.
+    (고아 데이터 정리)
+    
+    Spring에서 받는 것:
+    - db_item_ids: DB에 실제로 존재하는 모든 item_id 리스트 (필수)
+      예: [1, 2, 3, 5, 7, ...]
+    
+    Spring으로 보내는 것:
+    - success: 성공 여부
+    - total_faiss_items: FAISS에 있는 전체 항목 수
+    - total_db_items: DB에 있는 전체 항목 수
+    - orphaned_items: FAISS에는 있지만 DB에는 없는 항목 리스트
+    - deleted_count: 실제로 삭제된 항목 수
+    """
+    try:
+        data = request.get_json()
+        db_item_ids = data.get('db_item_ids', [])
+        
+        if not isinstance(db_item_ids, list):
+            return jsonify({'success': False, 'message': 'db_item_ids는 리스트여야 합니다'}), 400
+        
+        # FAISS 인덱스 초기화 확인
+        if not _faiss_initialized:
+            initialize_faiss()
+        
+        if faiss_index is None:
+            return jsonify({
+                'success': False,
+                'message': 'FAISS 인덱스가 초기화되지 않았습니다'
+            }), 500
+        
+        # DB item_id를 set으로 변환 (빠른 조회를 위해)
+        db_item_set = set(int(item_id) for item_id in db_item_ids)
+        
+        # FAISS에 있는 모든 item_id 추출
+        faiss_item_ids = set(id_mapping.values())
+        
+        # 고아 데이터 찾기: FAISS에는 있지만 DB에는 없는 항목들
+        orphaned_item_ids = faiss_item_ids - db_item_set
+        
+        print(f"🔍 동기화 시작:")
+        print(f"   DB 항목 수: {len(db_item_set)}")
+        print(f"   FAISS 항목 수: {len(faiss_item_ids)}")
+        print(f"   고아 데이터: {len(orphaned_item_ids)}개")
+        
+        if len(orphaned_item_ids) == 0:
+            print("✅ 동기화 완료: 고아 데이터 없음")
+            return jsonify({
+                'success': True,
+                'total_faiss_items': len(faiss_item_ids),
+                'total_db_items': len(db_item_set),
+                'orphaned_items': [],
+                'deleted_count': 0,
+                'message': '고아 데이터가 없습니다. 동기화 완료.'
+            })
+        
+        # 고아 데이터를 FAISS에서 삭제
+        deleted_count = 0
+        deleted_item_ids = []
+        
+        with _faiss_lock:
+            for orphaned_item_id in orphaned_item_ids:
+                try:
+                    # 해당 item_id의 faiss_idx 찾기
+                    faiss_indices_to_delete = [k for k, v in id_mapping.items() if v == orphaned_item_id]
+                    
+                    if len(faiss_indices_to_delete) == 0:
+                        continue
+                    
+                    # FAISS 인덱스에서 벡터 삭제
+                    if hasattr(faiss_index, 'remove_ids'):
+                        try:
+                            ids_to_remove = np.array(faiss_indices_to_delete, dtype=np.int64)
+                            faiss_index.remove_ids(ids_to_remove)
+                            deleted_count += len(faiss_indices_to_delete)
+                        except Exception as e:
+                            print(f"⚠️  FAISS 벡터 삭제 실패 (item_id={orphaned_item_id}): {str(e)}")
+                    
+                    # id_mapping에서 제거
+                    for faiss_idx in faiss_indices_to_delete:
+                        if faiss_idx in id_mapping:
+                            del id_mapping[faiss_idx]
+                    
+                    deleted_item_ids.append(orphaned_item_id)
+                    
+                except Exception as e:
+                    print(f"⚠️  항목 삭제 실패 (item_id={orphaned_item_id}): {str(e)}")
+                    continue
+        
+        # 영속성 저장
+        save_faiss()
+        
+        print(f"✅ 동기화 완료: {deleted_count}개 벡터 삭제됨 (고아 데이터 {len(orphaned_item_ids)}개)")
+        
+        return jsonify({
+            'success': True,
+            'total_faiss_items': len(faiss_item_ids),
+            'total_db_items': len(db_item_set),
+            'orphaned_items': sorted(list(orphaned_item_ids)),
+            'deleted_count': deleted_count,
+            'deleted_item_ids': sorted(deleted_item_ids),
+            'message': f'{deleted_count}개 벡터가 삭제되었습니다.'
+        })
+        
+    except Exception as e:
+        print(f"❌ 동기화 실패: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'message': str(e)}), 500
+
 @app.route('/api/v1/embedding/delete/<int:item_id>', methods=['DELETE'])
 def delete_embedding(item_id):
     """
     분실물 삭제 시 임베딩 제거
     
     프로세스:
-    - FAISS에서 물리적 삭제는 하지 않음 (성능 이슈)
-    - id_mapping에서만 제거하여 검색 결과에 나타나지 않도록 함
+    1. id_mapping에서 해당 item_id의 faiss_idx 찾기
+    2. FAISS 인덱스에서 벡터 물리적 삭제 (HNSW의 경우 remove_ids 사용)
+    3. id_mapping에서 제거
+    4. 영속성 저장
     
     Spring에서 받는 것:
     - item_id: 삭제할 분실물의 MySQL ID
     
     Spring으로 보내는 것:
     - success: 성공 여부
+    - deleted_count: 삭제된 벡터 개수
     """
     try:
-        # 매핑에서 제거
-        deleted = [k for k, v in id_mapping.items() if v == item_id]
-        for k in deleted:
-            del id_mapping[k]
+        with _faiss_lock:
+            # 1. id_mapping에서 해당 item_id의 faiss_idx 찾기
+            faiss_indices_to_delete = [k for k, v in id_mapping.items() if v == item_id]
+            
+            if len(faiss_indices_to_delete) == 0:
+                print(f"⚠️  삭제 시도: item_id={item_id}, 하지만 매핑에서 찾을 수 없음 (이미 삭제되었거나 존재하지 않음)")
+                return jsonify({'success': True, 'deleted_count': 0})
+            
+            # 2. FAISS 인덱스에서 벡터 물리적 삭제
+            deleted_count = 0
+            if hasattr(faiss_index, 'remove_ids'):
+                # HNSW 인덱스: remove_ids() 메서드 사용
+                try:
+                    # FAISS의 remove_ids는 numpy array를 받음
+                    ids_to_remove = np.array(faiss_indices_to_delete, dtype=np.int64)
+                    faiss_index.remove_ids(ids_to_remove)
+                    deleted_count = len(faiss_indices_to_delete)
+                    print(f"🗑️  FAISS에서 벡터 삭제 완료: item_id={item_id}, faiss_indices={faiss_indices_to_delete}")
+                except Exception as e:
+                    print(f"⚠️  FAISS 벡터 삭제 실패 (id_mapping만 제거): {str(e)}")
+                    # FAISS 삭제 실패해도 id_mapping은 제거
+            else:
+                # Flat 인덱스: 직접 삭제 불가능, id_mapping에서만 제거
+                print(f"⚠️  Flat 인덱스는 직접 삭제 불가능, id_mapping에서만 제거: item_id={item_id}")
+            
+            # 3. id_mapping에서 제거
+            for faiss_idx in faiss_indices_to_delete:
+                if faiss_idx in id_mapping:
+                    del id_mapping[faiss_idx]
+                    deleted_count = max(deleted_count, 1)  # 최소 1개는 삭제됨
         
+        # 4. 영속성 저장
         save_faiss()
-        print(f"🗑️  삭제: item_id={item_id}, 제거된 벡터={len(deleted)}개")
         
-        return jsonify({'success': True})
+        print(f"🗑️  삭제 완료: item_id={item_id}, 제거된 벡터={deleted_count}개 (FAISS 인덱스: {faiss_index.ntotal}개 남음)")
+        
+        return jsonify({'success': True, 'deleted_count': deleted_count})
         
     except Exception as e:
         print(f"❌ 삭제 실패: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'success': False, 'message': str(e)}), 500
 
 # Gunicorn으로 실행할 때도 FAISS 초기화는 warmup_models()에서 수행됨

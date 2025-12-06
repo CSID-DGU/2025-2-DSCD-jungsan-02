@@ -346,5 +346,35 @@ public class FlaskApiService {
             // Flask 서버가 꺼져있어도 계속 진행
         }
     }
+
+    /**
+     * Flask AI 서버에 FAISS와 DB 동기화 요청 (Admin API)
+     * DB에는 없지만 FAISS에는 있는 항목들을 삭제합니다.
+     */
+    public Map<String, Object> syncFaissWithDb(List<Long> dbItemIds) {
+        try {
+            Map<String, Object> request = Map.of("db_item_ids", dbItemIds);
+            
+            Map<String, Object> response = flaskRestClient.post()
+                    .uri("/api/v1/admin/sync-with-db")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(request)
+                    .retrieve()
+                    .body(Map.class);
+
+            if (response != null && Boolean.TRUE.equals(response.get("success"))) {
+                log.info("Successfully synced FAISS with DB. Deleted {} orphaned items", 
+                        response.get("deleted_count"));
+                return response;
+            }
+            
+            log.warn("Failed to sync FAISS with DB: {}", response);
+            return response != null ? response : Map.of("success", false, "message", "Unknown error");
+            
+        } catch (Exception e) {
+            log.error("Flask AI 서버에 연결할 수 없습니다. FAISS 동기화 실패", e);
+            throw new RuntimeException("Failed to sync FAISS with DB: " + e.getMessage(), e);
+        }
+    }
 }
 

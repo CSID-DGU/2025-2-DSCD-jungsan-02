@@ -77,9 +77,17 @@ KEYWORD_EXPANSION = {
     
     # 의류
     '옷': ['옷', '의류', '상의', '하의'],
+    '셔츠': ['셔츠', '와이셔츠', '드레스셔츠', '블라우스', '상의', '옷'],
+    '체크셔츠': ['체크셔츠', '체크 셔츠', '체크와이셔츠', '체크', '셔츠'],
+    '체크': ['체크', '체크무늬', '체크패턴', '체크셔츠', '체크와이셔츠'],
+    '스트라이프': ['스트라이프', '줄무늬', '줄', '스트라이프셔츠', '스트라이프티셔츠'],
+    '줄무늬': ['줄무늬', '스트라이프', '줄', '세로줄', '가로줄'],
+    '티셔츠': ['티셔츠', '티', '반팔', '긴팔', '상의'],
     '재킷': ['재킷', '자켓', '아우터'],
     '코트': ['코트', '아우터', '외투'],
     '후드': ['후드', '후드티', '후드집업'],
+    '바지': ['바지', '팬츠', '청바지', '슬랙스', '하의'],
+    '청바지': ['청바지', '데님', '바지', '하의'],
     
     # 색상 (일부 주요 색상)
     '검은색': ['검은색', '검정', '검정색', '블랙'],
@@ -206,10 +214,11 @@ def preprocess_text(
 
 def expand_search_query(query: str) -> List[str]:
     """
-    검색 쿼리 확장 (동의어/유사어 추가)
+    검색 쿼리 확장 (동의어/유사어 추가) - 혁신적 개선
     
     리소스 절약: 사전 기반 확장으로 LLM 없이 빠르게 처리
     검색 성능 향상: 동의어를 포함하여 검색 범위 확대
+    키워드 조합 확장: 색상+물품 조합도 확장
     
     Args:
         query: 원본 검색 쿼리
@@ -221,24 +230,23 @@ def expand_search_query(query: str) -> List[str]:
         return []
     
     expanded_queries = [query]  # 원본 쿼리 포함
-    
-    # 키워드 확장 사전을 사용하여 동의어 추가
-    words = query.split()
     added_queries = set()  # 중복 방지용
+    words = query.split()
     
+    # 1. 단어별 동의어 확장
     for word in words:
-        word_lower = word.lower()  # 대소문자 구분 없이 검색
+        word_lower = word.lower()
         
         # 정확히 일치하는 경우
         if word in KEYWORD_EXPANSION:
             for synonym in KEYWORD_EXPANSION[word]:
-                if synonym != word:  # 중복 제거
+                if synonym != word:
                     expanded_query = query.replace(word, synonym)
                     if expanded_query not in added_queries and expanded_query != query:
                         expanded_queries.append(expanded_query)
                         added_queries.add(expanded_query)
         
-        # 소문자로 변환하여 검색 (대소문자 구분 없이)
+        # 소문자로 변환하여 검색
         elif word_lower in KEYWORD_EXPANSION:
             for synonym in KEYWORD_EXPANSION[word_lower]:
                 if synonym.lower() != word_lower:
@@ -247,7 +255,59 @@ def expand_search_query(query: str) -> List[str]:
                         expanded_queries.append(expanded_query)
                         added_queries.add(expanded_query)
     
-    # 최대 8개로 제한하여 리소스 절약 (원본 포함)
-    return expanded_queries[:8]
+    # 2. 색상+물품 조합 확장 (혁신적 개선)
+    # 예: "빨간색 운동화" -> "빨강 운동화", "빨강색 신발", "레드 운동화" 등
+    color_words = ['빨간색', '빨강', '빨강색', '레드', '검은색', '검정', '검정색', '블랙',
+                   '흰색', '하양', '하얀색', '화이트', '파란색', '파랑', '파랑색', '블루',
+                   '노란색', '노랑', '노랑색', '옐로우', '초록색', '초록', '녹색', '그린',
+                   '회색', '그레이', '베이지색', '베이지', '갈색', '브라운', '분홍색', '핑크']
+    
+    item_words = ['운동화', '신발', '셔츠', '티셔츠', '가방', '지갑', '모자', '장갑']
+    
+    # 색상과 물품이 함께 있는 경우 조합 확장
+    found_colors = [w for w in words if w in color_words or any(cw in w for cw in color_words)]
+    found_items = [w for w in words if w in item_words or any(iw in w for iw in item_words)]
+    
+    if found_colors and found_items:
+        # 색상 동의어와 물품 동의어 조합
+        for color in found_colors:
+            if color in KEYWORD_EXPANSION:
+                color_synonyms = KEYWORD_EXPANSION[color]
+            else:
+                color_synonyms = [color]
+            
+            for item in found_items:
+                if item in KEYWORD_EXPANSION:
+                    item_synonyms = KEYWORD_EXPANSION[item]
+                else:
+                    item_synonyms = [item]
+                
+                # 색상+물품 조합 생성
+                for cs in color_synonyms[:2]:  # 최대 2개만
+                    for isyn in item_synonyms[:2]:  # 최대 2개만
+                        if cs != color or isyn != item:
+                            expanded_query = query.replace(color, cs).replace(item, isyn)
+                            if expanded_query not in added_queries and expanded_query != query:
+                                expanded_queries.append(expanded_query)
+                                added_queries.add(expanded_query)
+    
+    # 3. 패턴 키워드 확장 (체크, 스트라이프 등)
+    pattern_words = ['체크', '스트라이프', '줄무늬', '도트', '플라워']
+    for word in words:
+        if word in pattern_words:
+            # 패턴이 포함된 경우 패턴 키워드 추가
+            if '체크' in word or '체크' in query:
+                expanded_query = query + ' 체크'
+                if expanded_query not in added_queries:
+                    expanded_queries.append(expanded_query)
+                    added_queries.add(expanded_query)
+            if '스트라이프' in word or '줄무늬' in word or '줄' in word:
+                expanded_query = query + ' 스트라이프'
+                if expanded_query not in added_queries:
+                    expanded_queries.append(expanded_query)
+                    added_queries.add(expanded_query)
+    
+    # 최대 12개로 확장 (원본 포함) - 더 많은 조합 시도
+    return expanded_queries[:12]
 
 
