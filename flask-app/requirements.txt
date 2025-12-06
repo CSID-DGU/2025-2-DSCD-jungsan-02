@@ -1,16 +1,17 @@
 Flask==2.3.2
 gunicorn==21.2.0
 faiss-cpu==1.7.4
-numpy==1.24.3
-Pillow==10.0.0
+numpy>=1.24.3,<2.0.0  # torch 2.6 호환
+Pillow>=10.0.0
 flask-cors==4.0.0
-sentence-transformers==2.7.0
-torch==2.3.1
-transformers>=4.46.0  # Qwen2.5-VL 모델 지원을 위해 최신 버전 필요 (4.41.2는 qwen2_5_vl 아키텍처 미지원)
+sentence-transformers>=2.7.0  # torch 2.6 호환
+torch>=2.6.0  # CVE-2025-32434 보안 취약점 해결 및 최신 Transformers 호환
+torchvision>=0.21.0  # Qwen2.5-VL의 AutoVideoProcessor에 필요
+transformers>=4.46.0  # Qwen2.5-VL 모델 지원을 위해 최신 버전 필요
 accelerate>=0.30.1  # Transformers 최신 버전과 호환
 huggingface-hub>=0.24.6  # Transformers 최신 버전과 호환
-safetensors==0.4.3
-bitsandbytes==0.43.1
+safetensors>=0.4.3  # 최신 버전으로 업그레이드
+bitsandbytes>=0.43.1  # torch 2.6 호환 확인 필요 (필요시 업그레이드)
 soynlp==0.0.493
-qwen-vl-utils==0.0.10
+qwen-vl-utils>=0.0.10  # Qwen2.5-VL 지원
 sentencepiece==0.1.99
