@@ -12,10 +12,6 @@ import org.springframework.web.multipart.MultipartFile;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.dongguk.lostfound.domain.lostitem.LostItem;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -286,18 +282,14 @@ public class FlaskApiService {
             ObjectMapper objectMapper = new ObjectMapper();
             String itemsJson = objectMapper.writeValueAsString(itemsData);
             
-            // 요청 본문 구성
-            MultiValueMap<String, String> formData = new LinkedMultiValueMap<>();
-            formData.add("items", itemsJson);
-            
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.MULTIPART_FORM_DATA);
-            
-            HttpEntity<MultiValueMap<String, String>> requestEntity = new HttpEntity<>(formData, headers);
+            // MultipartBodyBuilder 사용 (RestClient가 제대로 지원함)
+            MultipartBodyBuilder builder = new MultipartBodyBuilder();
+            builder.part("items", itemsJson);
             
             Map<String, Object> response = flaskRestClient.post()
                     .uri("/api/v1/embedding/create-batch")
-                    .body(requestEntity)
+                    .contentType(MediaType.MULTIPART_FORM_DATA)
+                    .body(builder.build())
                     .retrieve()
                     .body(Map.class);
             
