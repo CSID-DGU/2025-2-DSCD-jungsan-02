@@ -17,6 +17,7 @@ from functools import lru_cache
 import hashlib
 import shutil
 import subprocess
+import fcntl  # 파일 잠금용
 
 from services.captioning import generate_caption
 from services.text_processing import preprocess_text, expand_search_query
@@ -130,27 +131,87 @@ def initialize_faiss():
     
     os.makedirs(FAISS_STORAGE_DIR, exist_ok=True)
     
+    # 파일 잠금 경로
+    lock_file_path = os.path.join(FAISS_STORAGE_DIR, '.faiss_lock')
+    
     if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(FAISS_MAPPING_PATH):
-        # 기존 인덱스 로드 (타입 자동 감지)
-        faiss_index = faiss.read_index(FAISS_INDEX_PATH)
-        with open(FAISS_MAPPING_PATH, 'rb') as f:
-            id_mapping = pickle.load(f)
-        index_type_name = type(faiss_index).__name__
-        print(f"✅ FAISS 인덱스 로드: {faiss_index.ntotal}개 벡터 (타입: {index_type_name})")
+        # 파일 크기 먼저 확인 (0바이트 파일은 손상된 것으로 간주)
+        index_size = os.path.getsize(FAISS_INDEX_PATH)
+        mapping_size = os.path.getsize(FAISS_MAPPING_PATH)
         
-        # HNSW 인덱스인 경우 ef_search 설정
-        if hasattr(faiss_index, 'hnsw'):
-            faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
-            print(f"   HNSW 파라미터 설정: ef_search={HNSW_EF_SEARCH}")
-        
-        # 인덱스 타입 불일치 경고 (설정과 다른 경우)
-        if FAISS_INDEX_TYPE.upper() == "HNSW" and "Flat" in index_type_name and "HNSW" not in index_type_name:
-            print(f"⚠️ 경고: 설정은 HNSW이지만 기존 인덱스는 {index_type_name}입니다.")
-            print(f"   기존 인덱스를 사용합니다. 새 인덱스를 원하면 기존 파일을 삭제하세요.")
-        elif FAISS_INDEX_TYPE.upper() == "FLAT" and "HNSW" in index_type_name:
-            print(f"⚠️ 경고: 설정은 Flat이지만 기존 인덱스는 {index_type_name}입니다.")
-            print(f"   기존 인덱스를 사용합니다. 새 인덱스를 원하면 기존 파일을 삭제하세요.")
-    else:
+        if index_size == 0 or mapping_size == 0:
+            print(f"⚠️ FAISS 파일 크기가 0입니다 (인덱스: {index_size}바이트, 매핑: {mapping_size}바이트). 새로 생성합니다.")
+            if os.path.exists(FAISS_INDEX_PATH):
+                os.remove(FAISS_INDEX_PATH)
+            if os.path.exists(FAISS_MAPPING_PATH):
+                os.remove(FAISS_MAPPING_PATH)
+        else:
+            # 파일 잠금을 사용하여 안전하게 로드 (다른 워커가 저장 중일 수 있음)
+            try:
+                with open(lock_file_path, 'w') as lock_file:
+                    # 공유 잠금 획득 (읽기는 여러 워커가 동시에 가능, 쓰기는 대기)
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
+                    
+                    try:
+                        # 기존 인덱스 로드 시도 (손상된 파일 처리)
+                        faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+                        with open(FAISS_MAPPING_PATH, 'rb') as f:
+                            id_mapping = pickle.load(f)
+                        index_type_name = type(faiss_index).__name__
+                        print(f"✅ FAISS 인덱스 로드: {faiss_index.ntotal}개 벡터 (타입: {index_type_name}, 크기: {index_size / 1024 / 1024:.2f}MB)")
+                        
+                        # HNSW 인덱스인 경우 ef_search 설정
+                        if hasattr(faiss_index, 'hnsw'):
+                            faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
+                            print(f"   HNSW 파라미터 설정: ef_search={HNSW_EF_SEARCH}")
+                        
+                        # 인덱스 타입 불일치 경고 (설정과 다른 경우)
+                        if FAISS_INDEX_TYPE.upper() == "HNSW" and "Flat" in index_type_name and "HNSW" not in index_type_name:
+                            print(f"⚠️ 경고: 설정은 HNSW이지만 기존 인덱스는 {index_type_name}입니다.")
+                            print(f"   기존 인덱스를 사용합니다. 새 인덱스를 원하면 기존 파일을 삭제하세요.")
+                        elif FAISS_INDEX_TYPE.upper() == "FLAT" and "HNSW" in index_type_name:
+                            print(f"⚠️ 경고: 설정은 Flat이지만 기존 인덱스는 {index_type_name}입니다.")
+                            print(f"   기존 인덱스를 사용합니다. 새 인덱스를 원하면 기존 파일을 삭제하세요.")
+                    finally:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except (RuntimeError, IOError, Exception) as e:
+            # 인덱스 파일이 손상된 경우 백업하고 새로 생성
+            print(f"❌ FAISS 인덱스 파일 손상 감지: {e}")
+            print(f"🔄 손상된 파일을 백업하고 새 인덱스를 생성합니다...")
+            
+            # 손상된 파일 백업
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_index_path = f"{FAISS_INDEX_PATH}.corrupted_{timestamp}"
+            backup_mapping_path = f"{FAISS_MAPPING_PATH}.corrupted_{timestamp}"
+            
+            try:
+                if os.path.exists(FAISS_INDEX_PATH):
+                    shutil.move(FAISS_INDEX_PATH, backup_index_path)
+                    print(f"   백업: {backup_index_path}")
+                if os.path.exists(FAISS_MAPPING_PATH):
+                    shutil.move(FAISS_MAPPING_PATH, backup_mapping_path)
+                    print(f"   백업: {backup_mapping_path}")
+            except Exception as backup_error:
+                print(f"   ⚠️ 백업 실패 (무시하고 계속): {backup_error}")
+                # 백업 실패해도 파일 삭제 시도
+                try:
+                    if os.path.exists(FAISS_INDEX_PATH):
+                        os.remove(FAISS_INDEX_PATH)
+                    if os.path.exists(FAISS_MAPPING_PATH):
+                        os.remove(FAISS_MAPPING_PATH)
+                except:
+                    pass
+            
+            # 새 인덱스 생성으로 진행
+            print(f"   새 인덱스를 생성합니다...")
+            # 아래 블록으로 진행하기 위해 파일이 없도록 설정
+            if os.path.exists(FAISS_INDEX_PATH):
+                os.remove(FAISS_INDEX_PATH)
+            if os.path.exists(FAISS_MAPPING_PATH):
+                os.remove(FAISS_MAPPING_PATH)
+    
+    # 인덱스 파일이 없거나 손상된 경우 새로 생성
+    if not os.path.exists(FAISS_INDEX_PATH) or not os.path.exists(FAISS_MAPPING_PATH):
         # 인덱스 타입에 따라 선택
         if FAISS_INDEX_TYPE.upper() == "HNSW":
             # HNSW 인덱스: 대량 데이터 검색 최적화 (근사 최근접 이웃)
@@ -169,12 +230,92 @@ def initialize_faiss():
     _faiss_initialized = True
 
 def save_faiss():
-    """FAISS 스냅샷 저장"""
+    """FAISS 스냅샷 저장 (파일 잠금으로 멀티 워커 충돌 방지)"""
+    global faiss_index, id_mapping
+    
+    if faiss_index is None:
+        print("⚠️ FAISS 인덱스가 없어 저장을 건너뜁니다.")
+        return
+    
     os.makedirs(FAISS_STORAGE_DIR, exist_ok=True)
-    faiss.write_index(faiss_index, FAISS_INDEX_PATH)
-    with open(FAISS_MAPPING_PATH, 'wb') as f:
-        pickle.dump(id_mapping, f)
-    print(f"💾 FAISS 저장: {faiss_index.ntotal}개 벡터")
+    
+    # 파일 잠금 경로
+    lock_file_path = os.path.join(FAISS_STORAGE_DIR, '.faiss_lock')
+    
+    # 파일 잠금을 사용하여 멀티 워커 동시 접근 방지
+    try:
+        with open(lock_file_path, 'w') as lock_file:
+            # 배타적 잠금 획득 (다른 워커는 대기)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            
+            try:
+                # 저장 전 디스크 공간 확인 (최소 1GB 필요)
+                stat = shutil.disk_usage(FAISS_STORAGE_DIR)
+                free_gb = stat.free / (1024**3)
+                if free_gb < 1.0:
+                    print(f"❌ 디스크 공간 부족으로 저장 실패 (여유: {free_gb:.2f}GB)")
+                    raise RuntimeError(f"디스크 공간 부족: {free_gb:.2f}GB < 1.0GB")
+                
+                # 원자적 쓰기: 임시 파일에 쓰고 성공 후 원본으로 이동
+                temp_index_path = f"{FAISS_INDEX_PATH}.tmp"
+                temp_mapping_path = f"{FAISS_MAPPING_PATH}.tmp"
+                
+                # 임시 파일에 저장
+                faiss.write_index(faiss_index, temp_index_path)
+                
+                with open(temp_mapping_path, 'wb') as f:
+                    pickle.dump(id_mapping, f)
+                
+                # 파일 크기 확인 (손상 방지)
+                temp_index_size = os.path.getsize(temp_index_path)
+                if temp_index_size == 0:
+                    raise RuntimeError("임시 인덱스 파일 크기가 0입니다")
+                
+                # 기존 파일이 있으면 백업
+                if os.path.exists(FAISS_INDEX_PATH):
+                    backup_path = f"{FAISS_INDEX_PATH}.backup"
+                    try:
+                        if os.path.exists(backup_path):
+                            os.remove(backup_path)
+                        shutil.copy2(FAISS_INDEX_PATH, backup_path)
+                    except:
+                        pass  # 백업 실패해도 계속 진행
+                
+                # 원자적 이동 (성공 시에만 원본 파일 교체)
+                shutil.move(temp_index_path, FAISS_INDEX_PATH)
+                shutil.move(temp_mapping_path, FAISS_MAPPING_PATH)
+                
+                # 최종 확인 (파일 존재 및 크기 검증)
+                if not os.path.exists(FAISS_INDEX_PATH):
+                    raise RuntimeError("인덱스 파일이 저장되지 않았습니다")
+                
+                final_size = os.path.getsize(FAISS_INDEX_PATH)
+                if final_size == 0:
+                    raise RuntimeError("저장된 인덱스 파일 크기가 0입니다")
+                
+                if final_size != temp_index_size:
+                    raise RuntimeError(f"파일 크기 불일치: 예상 {temp_index_size}, 실제 {final_size}")
+                
+                print(f"💾 FAISS 저장 완료: {faiss_index.ntotal}개 벡터 ({temp_index_size / 1024 / 1024:.2f}MB)")
+                
+            finally:
+                # 잠금 해제 (자동으로 해제됨)
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                
+    except BlockingIOError:
+        # 다른 워커가 사용 중이면 저장 건너뜀
+        print("⚠️ 다른 워커가 파일을 사용 중이어 저장을 건너뜁니다.")
+        return
+    except Exception as e:
+        # 실패 시 임시 파일 정리
+        for temp_path in [f"{FAISS_INDEX_PATH}.tmp", f"{FAISS_MAPPING_PATH}.tmp"]:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+        print(f"❌ FAISS 저장 실패: {e}")
+        raise
 
 # ========== AI 팀이 구현할 함수들 (현재는 더미) ==========
 
@@ -492,17 +633,26 @@ def create_embedding():
         
         # 4. FAISS 인덱스에 벡터 추가 (스레드 안전하게 처리)
         should_save = False
-        with _faiss_lock:
-            faiss_index.add(np.array([embedding_vector]))
-            faiss_idx = faiss_index.ntotal - 1
-            # 5. FAISS 인덱스 번호 ↔ MySQL item_id 매핑 저장
-            id_mapping[faiss_idx] = int(item_id)
-            # 저장 빈도 제어: N개마다 저장하여 디스크 I/O 최적화
-            global _pending_save_count
-            _pending_save_count += 1
-            if _pending_save_count >= _save_batch_size:
-                should_save = True
-                _pending_save_count = 0
+        # 파일 잠금을 사용하여 멀티 워커 환경에서 안전하게 FAISS에 추가
+        lock_file_path = os.path.join(FAISS_STORAGE_DIR, '.faiss_lock')
+        os.makedirs(FAISS_STORAGE_DIR, exist_ok=True)
+        
+        with open(lock_file_path, 'w') as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)  # 배타적 잠금
+            try:
+                with _faiss_lock:  # 같은 워커 내 스레드 동기화도 유지
+                    faiss_index.add(np.array([embedding_vector]))
+                    faiss_idx = faiss_index.ntotal - 1
+                    # 5. FAISS 인덱스 번호 ↔ MySQL item_id 매핑 저장
+                    id_mapping[faiss_idx] = int(item_id)
+                    # 저장 빈도 제어: N개마다 저장하여 디스크 I/O 최적화
+                    global _pending_save_count
+                    _pending_save_count += 1
+                    if _pending_save_count >= _save_batch_size:
+                        should_save = True
+                        _pending_save_count = 0
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         
         # 6. FAISS 인덱스 및 매핑 정보를 디스크에 저장 (영속성)
         # 배치 단위로 저장하여 디스크 I/O 최적화
@@ -639,13 +789,22 @@ def create_embeddings_batch():
                 # 3. 임베딩 벡터 생성 (캐시 활용)
                 embedding_vector = create_embedding_vector(final_text, use_cache=True)
                 
-                # 4. FAISS 인덱스에 벡터 추가 (스레드 안전하게 처리)
+                # 4. FAISS 인덱스에 벡터 추가 (멀티 워커 환경에서 안전하게 처리)
                 faiss_idx = None
                 before_count = faiss_index.ntotal
-                with _faiss_lock:
-                    faiss_index.add(np.array([embedding_vector]))
-                    faiss_idx = faiss_index.ntotal - 1
-                    id_mapping[faiss_idx] = int(item_id)
+                # 파일 잠금을 사용하여 멀티 워커 환경에서 안전하게 FAISS에 추가
+                lock_file_path = os.path.join(FAISS_STORAGE_DIR, '.faiss_lock')
+                os.makedirs(FAISS_STORAGE_DIR, exist_ok=True)
+                
+                with open(lock_file_path, 'w') as lock_file:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)  # 배타적 잠금
+                    try:
+                        with _faiss_lock:  # 같은 워커 내 스레드 동기화도 유지
+                            faiss_index.add(np.array([embedding_vector]))
+                            faiss_idx = faiss_index.ntotal - 1
+                            id_mapping[faiss_idx] = int(item_id)
+                    finally:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
                 
                 return {
                     'item_id': int(item_id),

@@ -18,9 +18,11 @@ public class AsyncConfig {
     @Bean(name = "embeddingExecutor")
     public ThreadPoolTaskExecutor embeddingExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(20); // 기본 스레드 수 (더 증가)
-        executor.setMaxPoolSize(50); // 최대 스레드 수 (더 증가)
-        executor.setQueueCapacity(1000); // 대기 큐 크기 (더 증가)
+        // Flask 서버 워커 수(2개)를 고려하여 동시 요청 수 제한
+        // 각 워커가 안정적으로 처리할 수 있는 수준으로 설정
+        executor.setCorePoolSize(4); // 기본 스레드 수 (20 -> 4로 감소)
+        executor.setMaxPoolSize(8); // 최대 스레드 수 (50 -> 8로 감소)
+        executor.setQueueCapacity(100); // 대기 큐 크기 (1000 -> 100으로 감소)
         executor.setThreadNamePrefix("embedding-");
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(120); // 종료 대기 시간 증가
