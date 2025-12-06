@@ -129,18 +129,29 @@ def _load_model(model_id: str = DEFAULT_MODEL_ID):
                 # 모델 다운로드 전 디스크 공간 확인 (약 4GB 필요)
                 _check_disk_space(min_free_gb=5.0)
                 
-                # GPU 메모리 확인
+                # GPU 메모리 확인 및 정리 (메모리 파편화 방지)
                 if torch.cuda.is_available():
+                    torch.cuda.empty_cache()  # 먼저 캐시 정리
+                    torch.cuda.synchronize()  # 동기화로 정리 완료 보장
                     gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
                     allocated = torch.cuda.memory_allocated(0) / (1024**3)
-                    free = gpu_memory - allocated
-                    print(f"💾 GPU 메모리 상태: 전체 {gpu_memory:.2f}GB, 사용 {allocated:.2f}GB, 여유 {free:.2f}GB")
+                    reserved = torch.cuda.memory_reserved(0) / (1024**3)
+                    free = gpu_memory - reserved  # reserved 기준으로 계산 (더 정확)
+                    print(f"💾 GPU 메모리 상태: 전체 {gpu_memory:.2f}GB, 할당 {allocated:.2f}GB, 예약 {reserved:.2f}GB, 여유 {free:.2f}GB")
                     
-                    if free < 2.0:  # 최소 2GB 필요
-                        print(f"⚠️ GPU 메모리 부족 ({free:.2f}GB < 2GB). 기존 모델 정리 중...")
+                    if free < 3.0:  # 최소 3GB 필요 (2GB -> 3GB로 증가, 안정성 확보)
+                        print(f"⚠️ GPU 메모리 부족 ({free:.2f}GB < 3GB). 기존 모델 정리 중...")
                         torch.cuda.empty_cache()
-                        free = torch.cuda.get_device_properties(0).total_memory / (1024**3) - torch.cuda.memory_allocated(0) / (1024**3)
+                        torch.cuda.synchronize()
+                        free = torch.cuda.get_device_properties(0).total_memory / (1024**3) - torch.cuda.memory_reserved(0) / (1024**3)
                         print(f"   정리 후 여유: {free:.2f}GB")
+                        
+                        if free < 3.0:
+                            raise RuntimeError(
+                                f"GPU 메모리가 부족합니다. "
+                                f"필요: 3GB 이상, 현재 여유: {free:.2f}GB. "
+                                f"다른 프로세스를 종료하거나 모델을 CPU로 오프로드하세요."
+                            )
                 
                 quantization = BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -152,24 +163,29 @@ def _load_model(model_id: str = DEFAULT_MODEL_ID):
                 # Qwen2.5-VL 모델 로드
                 print(f"📥 Qwen2.5-VL 모델 다운로드 시작: {model_id}")
                 try:
+                    # device_map을 명시적으로 설정하여 메모리 사용 최적화
+                    # "auto"는 때때로 비효율적으로 할당할 수 있음
                     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                         model_id,
-                        device_map="auto",
+                        device_map="cuda:0" if torch.cuda.is_available() else "cpu",  # "auto" -> 명시적 설정
                         trust_remote_code=True,
                         quantization_config=quantization,
                         low_cpu_mem_usage=True,  # CPU 메모리 사용량 최소화
+                        torch_dtype=torch.float16,  # 명시적 dtype 설정 (메모리 절약)
                     )
                 except Exception as e:
                     # GPU 메모리 부족 시 CPU 오프로드 시도
                     if "out of memory" in str(e).lower() or "CUDA" in str(e):
                         print(f"⚠️ GPU 메모리 부족, CPU 오프로드 시도: {e}")
+                        # CPU 오프로드 설정 (일부 레이어를 CPU로 이동)
                         quantization.llm_int8_enable_fp32_cpu_offload = True
                         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                             model_id,
-                            device_map="auto",
+                            device_map="auto",  # CPU 오프로드 시에는 auto 사용
                             trust_remote_code=True,
                             quantization_config=quantization,
                             low_cpu_mem_usage=True,
+                            torch_dtype=torch.float16,
                         )
                     else:
                         # fallback: AutoModel 사용
@@ -227,7 +243,18 @@ def generate_caption(
     processor = _load_processor(model_id)
     model = _load_model(model_id)
 
+    # 이미지 크기 제한 및 리사이즈 (메모리 절약 - 필수)
+    # Qwen2.5-VL의 권장 최대 해상도: 1344x1344
+    # 메모리 절약을 위해 896x896으로 제한 (약 50% 메모리 절약)
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    max_size = 896
+    original_size = image.size
+    if max(image.size) > max_size:
+        # 비율 유지하며 리사이즈
+        ratio = max_size / max(image.size)
+        new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+        print(f"📐 이미지 리사이즈: {original_size} -> {image.size} (메모리 절약)")
 
     messages = [
         {
@@ -244,30 +271,50 @@ def generate_caption(
         tokenize=False,
         add_generation_prompt=True,
     )
-    inputs = processor(
-        text=[chat_text],
-        images=[image],
-        return_tensors="pt",
-    ).to(model.device)
+    
+    # 입력 처리 및 메모리 정리
+    try:
+        inputs = processor(
+            text=[chat_text],
+            images=[image],
+            return_tensors="pt",
+        ).to(model.device)
+        
+        # 이미지 객체는 더 이상 필요 없으므로 명시적으로 정리
+        del image
+        
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=96,  # 128 -> 96으로 감소 (메모리 절약, 충분한 길이)
+                temperature=0.2,
+                do_sample=False,
+                num_beams=1,  # beam search 비활성화 (메모리 절약)
+                early_stopping=True,
+                pad_token_id=processor.tokenizer.eos_token_id if hasattr(processor.tokenizer, 'eos_token_id') else None,
+                use_cache=True,  # KV cache 사용 (명시적 설정)
+            )
 
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=128,
-            temperature=0.2,
-            do_sample=False,
+        prompt_length = inputs["input_ids"].shape[1]
+        generated_ids = generated_ids[:, prompt_length:]
+
+        outputs = processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
         )
 
-    prompt_length = inputs["input_ids"].shape[1]
-    generated_ids = generated_ids[:, prompt_length:]
-
-    outputs = processor.batch_decode(
-        generated_ids,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )
-
-    caption = outputs[0].strip()
-    return caption
+        caption = outputs[0].strip()
+        return caption
+        
+    finally:
+        # 메모리 정리 (중요: 메모리 누수 방지)
+        if 'inputs' in locals():
+            del inputs
+        if 'generated_ids' in locals():
+            del generated_ids
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()  # 동기화로 정리 완료 보장
 
 

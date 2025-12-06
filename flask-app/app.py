@@ -939,16 +939,19 @@ def create_embeddings_batch():
                     'message': str(e)
                 }
         
-        # 병렬 처리 (Qwen 7B 모델 리소스 고려하여 최대 3개로 감소)
-        # Qwen 7B는 메모리를 많이 사용하므로 동시 처리 수를 줄여서 안정성 확보
-        max_workers = min(3, len(items))  # 10 -> 3으로 감소
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_item = {executor.submit(process_item, item): item for item in items}
-            for future in concurrent.futures.as_completed(future_to_item):
-                result = future.result()
-                results.append(result)
-                if result.get('success'):
-                    successful_count += 1
+        # 순차 처리로 변경 (메모리 안정성 확보)
+        # Qwen 7B 모델은 메모리를 많이 사용하므로 동시 처리 시 OOM 발생 가능
+        # 순차 처리로 변경하여 안정성 확보 (성능은 다소 저하되지만 메모리 안정성 우선)
+        for item in items:
+            result = process_item(item)
+            results.append(result)
+            if result.get('success'):
+                successful_count += 1
+            
+            # 각 아이템 처리 후 메모리 정리 (선택적, 성능 저하 가능하므로 주석 처리)
+            # 필요시 주석 해제하여 메모리 정리 활성화
+            # if torch.cuda.is_available():
+            #     torch.cuda.empty_cache()
         
         # FAISS 인덱스 및 매핑 정보를 디스크에 저장 (배치 완료 후 한 번만)
         # 배치 API는 항상 저장하여 데이터 손실 방지
