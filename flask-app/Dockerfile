@@ -13,14 +13,14 @@ RUN apt-get update && apt-get install -y \
 # python 명령어 심볼릭 링크 (python3 -> python)
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
-# requirements 설치 (디스크 공간 절약을 위해 빌드 중 정리)
+# requirements 설치
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
+    python -c "import sentence_transformers; print('sentence_transformers 설치 확인:', sentence_transformers.__version__)" && \
+    python -c "import torch; print('torch 설치 확인:', torch.__version__)" && \
     pip cache purge && \
-    rm -rf /tmp/* /var/tmp/* && \
-    find /usr/local/lib/python3.*/dist-packages -type d -name "__pycache__" -exec rm -r {} + 2>/dev/null || true && \
-    find /usr/local/lib/python3.*/dist-packages -name "*.pyc" -delete 2>/dev/null || true
+    rm -rf /tmp/* /var/tmp/* /root/.cache/pip
 
 # 소스 복사
 COPY . .
