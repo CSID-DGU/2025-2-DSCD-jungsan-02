@@ -676,32 +676,36 @@ def search_embedding():
                 for idx, dist in zip(idxs[0], dists[0]):
                     if int(idx) != -1 and int(idx) in id_mapping:
                         item_id = id_mapping[int(idx)]
+                        score = float(dist)  # numpy float32를 Python float로 변환
                         # 여러 쿼리 중 최고 점수 유지
-                        if item_id not in all_candidates or dist > all_candidates[item_id]:
-                            all_candidates[item_id] = dist
+                        if item_id not in all_candidates or score > all_candidates[item_id]:
+                            all_candidates[item_id] = score
             
             # 원본 쿼리 결과와 병합
             for idx, dist in zip(indices[0], distances[0]):
                 if int(idx) != -1 and int(idx) in id_mapping:
                     item_id = id_mapping[int(idx)]
-                    if item_id not in all_candidates or dist > all_candidates[item_id]:
-                        all_candidates[item_id] = dist
+                    score = float(dist)  # numpy float32를 Python float로 변환
+                    if item_id not in all_candidates or score > all_candidates[item_id]:
+                        all_candidates[item_id] = score
             
             # 점수 순으로 정렬 및 유사도 임계값 필터링
             sorted_candidates = sorted(all_candidates.items(), key=lambda x: x[1], reverse=True)
             # 유사도 임계값 이상인 결과만 필터링
             filtered_candidates = [
-                (item_id, score) for item_id, score in sorted_candidates
-                if score >= SIMILARITY_THRESHOLD
+                (item_id, float(score)) for item_id, score in sorted_candidates
+                if float(score) >= SIMILARITY_THRESHOLD
             ]
             
             # 최소 결과 수 보장 (임계값을 만족하는 결과가 적어도 최소 개수는 반환)
             if len(filtered_candidates) < MIN_RESULTS_TO_RETURN and len(sorted_candidates) > 0:
                 # 임계값을 만족하는 결과가 적으면 상위 결과를 포함 (최소 개수 보장)
-                filtered_candidates = sorted_candidates[:max(MIN_RESULTS_TO_RETURN, top_k)]
+                filtered_candidates = [
+                    (item_id, float(score)) for item_id, score in sorted_candidates[:max(MIN_RESULTS_TO_RETURN, top_k)]
+                ]
             
             item_ids = [item_id for item_id, _ in filtered_candidates[:top_k]]
-            scores = [score for _, score in filtered_candidates[:top_k]]
+            scores = [float(score) for _, score in filtered_candidates[:top_k]]  # 명시적으로 Python float로 변환
         else:
             # 단일 쿼리 검색
             debug_pairs = [
@@ -745,10 +749,19 @@ def search_embedding():
         print(f"📊 유사도 임계값: {SIMILARITY_THRESHOLD}, 임계값 이상: {filtered_count}개")
         print(f"📊 상위 10개 유사도 점수: {result_pairs}")
         
+        # 안전장치: 모든 scores를 Python float로 강제 변환 (numpy 타입 방지)
+        safe_scores = []
+        for s in scores:
+            try:
+                safe_scores.append(float(s))  # numpy float32, float64 등 모든 숫자 타입을 Python float로 변환
+            except (TypeError, ValueError):
+                # 변환 실패 시 0.0으로 대체 (안전장치)
+                safe_scores.append(0.0)
+        
         return jsonify({
             'success': True,
             'item_ids': item_ids,
-            'scores': scores  # 유사도 점수도 함께 반환
+            'scores': safe_scores[:top_k] if safe_scores else []  # 안전하게 변환된 점수만 반환
         })
         
     except Exception as e:
@@ -813,11 +826,11 @@ def search_by_image():
         scores = []
         for idx, dist in zip(indices[0], distances[0]):
             if int(idx) != -1 and int(idx) in id_mapping:
-                score = float(dist)
+                score = float(dist)  # numpy float32를 Python float로 명시적 변환
                 # 유사도 임계값 이상인 결과만 포함
                 if score >= SIMILARITY_THRESHOLD:
                     item_ids.append(id_mapping[int(idx)])
-                    scores.append(score)
+                    scores.append(float(score))  # 명시적으로 Python float로 변환
         
         # 최소 결과 수 보장
         if len(item_ids) < MIN_RESULTS_TO_RETURN:
@@ -826,21 +839,30 @@ def search_by_image():
             for idx, dist in zip(indices[0], distances[0]):
                 if int(idx) != -1 and int(idx) in id_mapping:
                     item_ids.append(id_mapping[int(idx)])
-                    scores.append(float(dist))
+                    scores.append(float(dist))  # numpy float32를 Python float로 변환
                     if len(item_ids) >= MIN_RESULTS_TO_RETURN:
                         break
         
         # top_k만큼만 반환
         item_ids = item_ids[:top_k]
-        scores = scores[:top_k] if scores else []
+        scores = [float(s) for s in scores[:top_k]] if scores else []  # 모든 점수를 Python float로 변환
         
-        filtered_count = len([s for s in scores if s >= SIMILARITY_THRESHOLD]) if scores else len(item_ids)
+        # 안전장치: 모든 scores를 Python float로 강제 변환 (numpy 타입 방지)
+        safe_scores = []
+        for s in scores:
+            try:
+                safe_scores.append(float(s))  # numpy float32, float64 등 모든 숫자 타입을 Python float로 변환
+            except (TypeError, ValueError):
+                # 변환 실패 시 0.0으로 대체 (안전장치)
+                safe_scores.append(0.0)
+        
+        filtered_count = len([s for s in safe_scores if s >= SIMILARITY_THRESHOLD]) if safe_scores else len(item_ids)
         print(f"🔍 이미지 검색 완료: top_k={top_k}, 결과={len(item_ids)}개, 임계값 이상: {filtered_count}개")
         
         return jsonify({
             'success': True,
             'item_ids': item_ids,
-            'scores': scores  # 유사도 점수도 함께 반환
+            'scores': safe_scores[:top_k] if safe_scores else []  # 안전하게 변환된 점수만 반환
         })
         
     except Exception as e:
