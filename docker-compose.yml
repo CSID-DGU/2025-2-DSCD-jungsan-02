@@ -12,7 +12,7 @@ services:
       EMBEDDING_MODEL_NAME: "BAAI/bge-m3"
       EMBEDDING_DIMENSION: "1024"
       FAISS_STORAGE_DIR: "/app/faiss-data"
-      GUNICORN_WORKERS: "3"  # 안정성을 위해 3개로 감소 (필요시 4개까지 증가 가능) 
+      GUNICORN_WORKERS: "2"  # Qwen 7B 모델 리소스 고려하여 2개로 감소 (메모리 절약) 
     volumes:
       - ./faiss-data:/app/faiss-data
     networks:

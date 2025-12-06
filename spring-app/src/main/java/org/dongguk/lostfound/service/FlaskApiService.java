@@ -345,7 +345,12 @@ public class FlaskApiService {
      */
     public Map<String, Object> syncFaissWithDb(List<Long> dbItemIds) {
         try {
+            log.info("Flask AI 서버에 동기화 요청 전송: {}개 item_id", dbItemIds.size());
+            
             Map<String, Object> request = Map.of("db_item_ids", dbItemIds);
+            
+            log.debug("요청 URL: /api/v1/admin/sync-with-db");
+            log.debug("요청 본문 크기: {}개 item_id", dbItemIds.size());
             
             Map<String, Object> response = flaskRestClient.post()
                     .uri("/api/v1/admin/sync-with-db")
@@ -354,17 +359,24 @@ public class FlaskApiService {
                     .retrieve()
                     .body(Map.class);
 
+            log.info("Flask AI 서버 응답 수신: {}", response);
+
             if (response != null && Boolean.TRUE.equals(response.get("success"))) {
-                log.info("Successfully synced FAISS with DB. Deleted {} orphaned items", 
+                log.info("✅ FAISS 동기화 성공. 삭제된 고아 항목: {}개", 
                         response.get("deleted_count"));
                 return response;
             }
             
-            log.warn("Failed to sync FAISS with DB: {}", response);
+            log.warn("⚠️ FAISS 동기화 실패: {}", response);
             return response != null ? response : Map.of("success", false, "message", "Unknown error");
             
         } catch (Exception e) {
-            log.error("Flask AI 서버에 연결할 수 없습니다. FAISS 동기화 실패", e);
+            log.error("❌ Flask AI 서버에 연결할 수 없습니다. FAISS 동기화 실패", e);
+            log.error("예외 상세: {}", e.getClass().getName());
+            log.error("예외 메시지: {}", e.getMessage());
+            if (e.getCause() != null) {
+                log.error("원인: {}", e.getCause().getMessage());
+            }
             throw new RuntimeException("Failed to sync FAISS with DB: " + e.getMessage(), e);
         }
     }

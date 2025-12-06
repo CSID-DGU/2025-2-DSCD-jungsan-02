@@ -517,12 +517,13 @@ def create_embeddings_batch():
                 image_description = ""
                 caption_failed = False
                 if image_url:
-                    max_retries = 2
+                    # Qwen 7B 모델 리소스 고려: 재시도 1회로 감소, 타임아웃 단축
+                    max_retries = 1  # 2 -> 1로 감소하여 리소스 절약
                     for attempt in range(max_retries):
                         try:
                             response = requests.get(
                                 image_url, 
-                                timeout=(5, 15),  # (연결 타임아웃, 읽기 타임아웃)
+                                timeout=(3, 10),  # 타임아웃 단축: (5,15) -> (3,10)
                                 stream=True,
                                 headers={'User-Agent': 'Mozilla/5.0'}  # 일부 서버에서 필요
                             )
@@ -539,12 +540,9 @@ def create_embeddings_batch():
                                 caption_failed = True
                                 break  # 캡셔닝 실패 시 루프 종료
                         except Exception as e:
-                            if attempt == max_retries - 1:
-                                caption_failed = True
-                                print(f"⚠️ 이미지 다운로드/캡셔닝 실패 (item_id={item_id}, 시도 {attempt+1}/{max_retries}): {e}")
-                            else:
-                                time.sleep(0.5 * (attempt + 1))  # 지수 백오프
-                            # 마지막 시도 실패 시 텍스트로 진행
+                            caption_failed = True
+                            print(f"⚠️ 이미지 다운로드/캡셔닝 실패 (item_id={item_id}): {e}")
+                            # 재시도 없이 바로 텍스트로 진행하여 리소스 절약
                 
                 # 캡셔닝 실패 시 원본 description 사용
                 if caption_failed and not image_description and raw_description:
@@ -599,8 +597,9 @@ def create_embeddings_batch():
                     'message': str(e)
                 }
         
-        # 병렬 처리 (최대 10개 동시 처리)
-        max_workers = min(10, len(items))
+        # 병렬 처리 (Qwen 7B 모델 리소스 고려하여 최대 3개로 감소)
+        # Qwen 7B는 메모리를 많이 사용하므로 동시 처리 수를 줄여서 안정성 확보
+        max_workers = min(3, len(items))  # 10 -> 3으로 감소
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_item = {executor.submit(process_item, item): item for item in items}
             for future in concurrent.futures.as_completed(future_to_item):

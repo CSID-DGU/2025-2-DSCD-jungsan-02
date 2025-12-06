@@ -367,8 +367,9 @@ public class CsvDataImportService {
      * 각 배치마다 여러 아이템을 한 번에 Flask 서버로 전송
      */
     private List<CompletableFuture<Void>> createEmbeddingsAsync(List<LostItem> savedItems) {
-        // 배치 크기 설정 (한 번에 처리할 아이템 수)
-        int batchSize = 20; // 배치 크기 조정 가능
+        // 배치 크기 설정 (Qwen 7B 모델 리소스 고려하여 10개로 감소)
+        // Qwen 7B는 메모리를 많이 사용하므로 배치 크기를 줄여서 안정성 확보
+        int batchSize = 10; // 20 -> 10으로 감소
         
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         
