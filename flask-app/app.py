@@ -130,12 +130,40 @@ def _try_load_faiss_file() -> tuple[bool, Optional[object], Optional[dict]]:
             print(f"⚠️ FAISS 인덱스 파일 크기가 0입니다. 손상된 파일로 간주합니다.")
             return False, None, None
         
-        # 파일 읽기 시도
-        faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+        # 파일 읽기 전에 파일이 완전히 쓰여졌는지 확인
+        # 파일 크기가 일정 시간 동안 변하지 않으면 완전히 쓰여진 것으로 간주
+        import time
+        prev_size = index_size
+        for _ in range(5):  # 최대 5번 확인 (0.1초 간격)
+            time.sleep(0.1)
+            current_size = os.path.getsize(FAISS_INDEX_PATH)
+            if current_size != prev_size:
+                # 파일이 아직 쓰여지고 있음
+                prev_size = current_size
+            else:
+                break
+        
+        # 파일 읽기 시도 (명시적으로 예외 처리)
+        try:
+            faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+        except RuntimeError as e:
+            # FAISS 읽기 에러 (파일 손상 등)
+            error_msg = str(e)
+            if "read error" in error_msg or "ret == (size)" in error_msg:
+                print(f"❌ FAISS 파일 읽기 에러 감지: {error_msg}")
+                print(f"   파일 크기: {os.path.getsize(FAISS_INDEX_PATH)} bytes")
+                return False, None, None
+            else:
+                # 다른 종류의 RuntimeError는 재발생
+                raise
         
         # 매핑 파일 읽기
-        with open(FAISS_MAPPING_PATH, 'rb') as f:
-            id_mapping = pickle.load(f)
+        try:
+            with open(FAISS_MAPPING_PATH, 'rb') as f:
+                id_mapping = pickle.load(f)
+        except (pickle.UnpicklingError, EOFError, IOError) as e:
+            print(f"❌ FAISS 매핑 파일 읽기 실패: {type(e).__name__}: {e}")
+            return False, None, None
         
         # 검증: 인덱스와 매핑의 일관성 확인
         if faiss_index.ntotal != len(id_mapping):
@@ -143,7 +171,7 @@ def _try_load_faiss_file() -> tuple[bool, Optional[object], Optional[dict]]:
             return False, None, None
         
         return True, faiss_index, id_mapping
-    except (RuntimeError, IOError, OSError, pickle.UnpicklingError, Exception) as e:
+    except (RuntimeError, IOError, OSError, Exception) as e:
         # 손상된 파일 감지 (모든 예외 타입 명시적으로 처리)
         print(f"❌ FAISS 파일 손상 감지: {type(e).__name__}: {e}")
         import traceback

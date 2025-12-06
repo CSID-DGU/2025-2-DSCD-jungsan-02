@@ -96,8 +96,36 @@ jobs:
           username: mj
           key: ${{ secrets.PRIVATE_KEY }}
           script: |
+            # 디스크 공간 확인
+            echo "📊 디스크 사용량 확인:"
+            df -h
+            
+            # 기존 컨테이너 중지
             cd /home/mj/lostfound
+            docker compose down || true
+            
+            # Docker 시스템 정리 (사용하지 않는 이미지, 컨테이너, 네트워크 제거)
+            echo "🧹 Docker 시스템 정리 중..."
+            docker system prune -a -f --volumes || true
+            
+            # 사용하지 않는 이미지 제거
+            docker image prune -a -f || true
+            
+            # 디스크 공간 재확인
+            echo "📊 정리 후 디스크 사용량:"
+            df -h
+            
+            # 최신 이미지 다운로드
+            echo "📥 최신 이미지 다운로드 중..."
             docker compose pull
-            docker compose down
+            
+            # 컨테이너 시작
+            echo "🚀 컨테이너 시작 중..."
             docker compose up -d --remove-orphans
-            docker image prune -f
+            
+            # 사용하지 않는 이미지 정리
+            docker image prune -f || true
+            
+            # 최종 디스크 사용량 확인
+            echo "📊 최종 디스크 사용량:"
+            df -h
