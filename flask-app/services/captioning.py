@@ -7,9 +7,23 @@ import torch
 from PIL import Image
 from transformers import (
     AutoProcessor,
-    AutoModelForCausalLM,
     BitsAndBytesConfig,
 )
+
+# Qwen2.5-VL 모델을 위한 클래스 import
+# transformers 4.51.3+ 에서 Qwen2_5_VLForConditionalGeneration 지원
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration
+except ImportError:
+    try:
+        # 대체 클래스명 시도
+        from transformers import Qwen2VLForConditionalGeneration as Qwen2_5_VLForConditionalGeneration
+    except ImportError:
+        # trust_remote_code=True로 자동 클래스 감지
+        from transformers import AutoModelForCausalLM
+        # 실제로는 AutoModelForVision2Seq를 사용해야 하지만, 
+        # trust_remote_code=True로 모델이 자동으로 올바른 클래스를 선택함
+        Qwen2_5_VLForConditionalGeneration = AutoModelForCausalLM
 
 DEFAULT_MODEL_ID = os.getenv(
     "CAPTION_MODEL_ID",
@@ -19,23 +33,45 @@ DEFAULT_MODEL_ID = os.getenv(
 
 @lru_cache(maxsize=1)
 def _load_processor(model_id: str = DEFAULT_MODEL_ID) -> AutoProcessor:
-    return AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    return AutoProcessor.from_pretrained(
+        model_id, 
+        trust_remote_code=True,
+        use_fast=False,  # fast processor 경고 방지
+    )
 
 
 @lru_cache(maxsize=1)
-def _load_model(model_id: str = DEFAULT_MODEL_ID) -> AutoModelForCausalLM:
+def _load_model(model_id: str = DEFAULT_MODEL_ID):
     quantization = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.float16,
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        device_map="auto",
-        trust_remote_code=True,
-        quantization_config=quantization,
-    )
+    # Qwen2.5-VL 모델 로드
+    # trust_remote_code=True로 모델이 자동으로 올바른 클래스를 선택
+    try:
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_id,
+            device_map="auto",
+            trust_remote_code=True,
+            quantization_config=quantization,
+        )
+    except Exception as e:
+        # fallback: AutoModel 사용 (trust_remote_code로 자동 감지)
+        from transformers import AutoModel
+        model = AutoModel.from_pretrained(
+            model_id,
+            device_map="auto",
+            trust_remote_code=True,
+            quantization_config=quantization,
+        )
+        # generate 메서드가 있는지 확인
+        if not hasattr(model, 'generate'):
+            raise RuntimeError(
+                f"로드된 모델이 generate 메서드를 지원하지 않습니다. "
+                f"transformers 버전을 4.51.3 이상으로 업데이트하세요. 원본 에러: {e}"
+            )
     model.eval()
     return model
 
