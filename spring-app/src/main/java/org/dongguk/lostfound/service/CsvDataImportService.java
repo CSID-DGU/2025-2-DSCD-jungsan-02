@@ -261,16 +261,13 @@ public class CsvDataImportService {
                         continue;
                     }
                     
-                    // User 가져오기 또는 생성
-                    User user = custodyUserMap.computeIfAbsent(custodyPlace, place -> {
-                        return userRepository.findByLoginId(place)
-                            .orElseGet(() -> {
-                                // User가 없으면 생성
-                                String encodedPassword = passwordEncoder.encode(DEFAULT_PASSWORD);
-                                User newUser = User.create(place, encodedPassword);
-                                return userRepository.save(newUser);
-                            });
-                    });
+                    // User 가져오기 또는 생성 (트랜잭션 관리 개선 - computeIfAbsent 사용 시 self-invocation 문제 방지)
+                    User user = custodyUserMap.get(custodyPlace);
+                    if (user == null) {
+                        // 트랜잭션 컨텍스트 내에서 명시적으로 호출하여 connection leak 방지
+                        user = getOrCreateUser(custodyPlace);
+                        custodyUserMap.put(custodyPlace, user);
+                    }
                     
                     // 보관소 위치 정보 가져오기 (위도, 경도)
                     CustodyLocation custodyLocation = custodyLocationRepository.findByName(custodyPlace)
@@ -350,6 +347,21 @@ public class CsvDataImportService {
         }
         
         return new ImportResult(savedCount, skippedCount, errorCount);
+    }
+    
+    /**
+     * User를 가져오거나 없으면 생성
+     * 트랜잭션 컨텍스트 내에서 실행되어 connection leak 방지
+     */
+    @Transactional
+    public User getOrCreateUser(String custodyPlace) {
+        return userRepository.findByLoginId(custodyPlace)
+            .orElseGet(() -> {
+                // User가 없으면 생성
+                String encodedPassword = passwordEncoder.encode(DEFAULT_PASSWORD);
+                User newUser = User.create(custodyPlace, encodedPassword);
+                return userRepository.save(newUser);
+            });
     }
     
     /**
