@@ -14,6 +14,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -56,7 +57,13 @@ public class CsvDataImportService {
         this.passwordEncoder = passwordEncoder;
         this.flaskApiService = flaskApiService;
         this.embeddingExecutor = embeddingExecutor;
-        this.transactionTemplate = new TransactionTemplate(transactionManager);
+        
+        // TransactionTemplate 설정: 명시적으로 트랜잭션 속성 설정
+        TransactionTemplate template = new TransactionTemplate(transactionManager);
+        template.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
+        template.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+        template.setTimeout(30); // 30초 타임아웃
+        this.transactionTemplate = template;
     }
     
     private static final String DEFAULT_PASSWORD = "1234";
@@ -355,44 +362,74 @@ public class CsvDataImportService {
     
     /**
      * User를 가져오거나 없으면 생성
-     * 트랜잭션 컨텍스트 내에서 실행되어 connection leak 방지
-     * 읽기 전용 트랜잭션으로 먼저 조회하고, 없을 경우 TransactionTemplate을 사용하여
-     * 명시적으로 새로운 트랜잭션에서 생성 (같은 클래스 내 호출 시 프록시 문제 해결)
+     * TransactionTemplate을 사용하여 명시적으로 트랜잭션 관리
+     * 같은 클래스 내 호출 시에도 트랜잭션이 제대로 작동하도록 함
+     * 각 트랜잭션이 완료되면 자동으로 커밋/롤백되고 connection이 닫힘
      */
-    @Transactional(readOnly = true)
     public User getOrCreateUser(String custodyPlace) {
-        // 먼저 조회 시도
-        Optional<User> existingUser = userRepository.findByLoginId(custodyPlace);
-        if (existingUser.isPresent()) {
-            return existingUser.get();
+        try {
+            // 먼저 조회 시도 - 트랜잭션 내에서 실행되어 connection leak 방지
+            User existingUser = transactionTemplate.execute(status -> {
+                try {
+                    return userRepository.findByLoginId(custodyPlace).orElse(null);
+                } catch (Exception e) {
+                    log.error("User 조회 중 오류 발생: {}", custodyPlace, e);
+                    throw e;
+                }
+            });
+            
+            if (existingUser != null) {
+                return existingUser;
+            }
+            
+            // 없으면 쓰기 트랜잭션에서 생성 - 트랜잭션 완료 시 자동 커밋 및 connection 닫힘
+            return transactionTemplate.execute(status -> {
+                try {
+                    String encodedPassword = passwordEncoder.encode(DEFAULT_PASSWORD);
+                    User newUser = User.create(custodyPlace, encodedPassword);
+                    return userRepository.save(newUser);
+                } catch (Exception e) {
+                    log.error("User 생성 중 오류 발생: {}", custodyPlace, e);
+                    throw e;
+                }
+            });
+        } catch (Exception e) {
+            log.error("getOrCreateUser 실패: {}", custodyPlace, e);
+            throw e;
         }
-        
-        // 없으면 TransactionTemplate을 사용하여 명시적으로 새로운 트랜잭션에서 생성
-        // 같은 클래스 내 호출 시에도 트랜잭션이 제대로 작동하도록 함
-        return transactionTemplate.execute(status -> {
-            String encodedPassword = passwordEncoder.encode(DEFAULT_PASSWORD);
-            User newUser = User.create(custodyPlace, encodedPassword);
-            return userRepository.save(newUser);
-        });
     }
     
     /**
      * 보관소 위치 정보 조회
-     * 트랜잭션 컨텍스트 내에서 실행되어 connection leak 방지
-     * REQUIRES_NEW 제거: 읽기 전용 작업이므로 일반 트랜잭션으로 충분하며, connection leak 방지
+     * TransactionTemplate을 사용하여 명시적으로 트랜잭션 관리
+     * 같은 클래스 내 호출 시에도 트랜잭션이 제대로 작동하도록 함
+     * 트랜잭션 완료 시 자동으로 커밋되고 connection이 닫힘
      */
-    @Transactional(readOnly = true)
     public CustodyLocation getCustodyLocation(String custodyPlace) {
-        return custodyLocationRepository.findByName(custodyPlace).orElse(null);
+        try {
+            return transactionTemplate.execute(status -> {
+                try {
+                    return custodyLocationRepository.findByName(custodyPlace).orElse(null);
+                } catch (Exception e) {
+                    log.error("보관소 위치 조회 중 오류 발생: {}", custodyPlace, e);
+                    throw e;
+                }
+            });
+        } catch (Exception e) {
+            log.error("getCustodyLocation 실패: {}", custodyPlace, e);
+            throw e;
+        }
     }
     
     /**
      * 배치 단위로 트랜잭션을 분리하여 저장
      * 각 배치마다 즉시 커밋되므로 DB에 바로 반영됨
+     * TransactionTemplate을 사용하여 같은 클래스 내 호출 시에도 트랜잭션이 제대로 작동하도록 함
      */
-    @Transactional
     public List<LostItem> saveBatchWithTransaction(List<LostItem> lostItems) {
-        return lostItemRepository.saveAll(lostItems);
+        return transactionTemplate.execute(status -> 
+            lostItemRepository.saveAll(lostItems)
+        );
     }
     
     /**
