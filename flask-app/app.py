@@ -1016,12 +1016,6 @@ def search_embedding():
         
         top_k = data.get('top_k', 10)
         
-        # 검색 쿼리 확장 (동의어 추가로 검색 성능 향상)
-        # 혁신적 개선: 더 많은 조합과 확장
-        expanded_queries = expand_search_query(query)
-        if len(expanded_queries) > 1:
-            print(f"🔍 검색 쿼리 확장: 원본='{query}', 확장={expanded_queries[:5]} (총 {len(expanded_queries)}개)")
-        
         if not query:
             return jsonify({'success': False, 'message': '검색어 필요'}), 400
         
@@ -1034,118 +1028,45 @@ def search_embedding():
             return jsonify({'success': True, 'item_ids': []})
         
         # 1. 검색어를 임베딩 벡터로 변환 (BGE-M3 사용, 캐시 활용)
-        #    확장된 쿼리들을 배치로 처리하여 리소스 효율 향상
-        #    혁신적 개선: 원본 쿼리에 가중치를 더 높게 적용
-        if len(expanded_queries) > 1:
-            # 여러 쿼리를 배치로 임베딩 (리소스 효율적)
-            query_vectors = create_embedding_vectors_batch(expanded_queries, use_cache=True)
-            # 원본 쿼리 벡터를 메인으로 사용
-            query_vector = query_vectors[0]
-        else:
-            query_vector = create_embedding_vector(query, use_cache=True)
+        query_vector = create_embedding_vector(query, use_cache=True)
         
         # 2. FAISS에서 코사인 유사도 기반 Top-K 검색
-        #    혁신적 개선: 더 많은 후보를 가져와서 재랭킹
-        k = min(top_k * 3, faiss_index.ntotal)  # 2배 -> 3배로 증가하여 더 많은 후보 확보
+        k = min(top_k * 3, faiss_index.ntotal)
         
-        # HNSW 인덱스인 경우 ef_search 파라미터 설정 (정확도와 성능 균형)
+        # HNSW 인덱스인 경우 ef_search 파라미터 설정
         if hasattr(faiss_index, 'hnsw'):
-            # k보다 충분히 큰 값으로 설정하여 정확도 향상
-            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 2)  # 3 -> 2로 줄여서 리소스 절약
+            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 2)
         
         # 검색 실행
         distances, indices = faiss_index.search(np.array([query_vector]), k)
         
-        # 확장된 쿼리로 추가 검색 (검색 성능 향상)
-        # 혁신적 개선: 원본 쿼리에 더 높은 가중치 적용
-        if len(expanded_queries) > 1 and len(query_vectors) > 1:
-            all_candidates = {}  # item_id -> (최고 점수, 쿼리 타입)
-            query_weights = {'original': 1.0, 'expanded': 0.85}  # 원본 쿼리에 더 높은 가중치
-            
-            # 원본 쿼리 결과 (가중치 1.0)
-            for idx, dist in zip(indices[0], distances[0]):
-                if int(idx) != -1 and int(idx) in id_mapping:
-                    item_id = id_mapping[int(idx)]
-                    score = float(dist) * query_weights['original']  # 원본 쿼리 가중치 적용
-                    if item_id not in all_candidates or score > all_candidates[item_id][0]:
-                        all_candidates[item_id] = (score, 'original')
-            
-            # 확장 쿼리 결과 (가중치 0.85)
-            for qv in query_vectors[1:]:  # 원본 제외한 확장 쿼리들
-                dists, idxs = faiss_index.search(np.array([qv]), k)
-                for idx, dist in zip(idxs[0], dists[0]):
-                    if int(idx) != -1 and int(idx) in id_mapping:
-                        item_id = id_mapping[int(idx)]
-                        score = float(dist) * query_weights['expanded']  # 확장 쿼리 가중치 적용
-                        # 원본 쿼리 결과보다 낮으면 업데이트하지 않음 (원본 우선)
-                        if item_id not in all_candidates or score > all_candidates[item_id][0]:
-                            all_candidates[item_id] = (score, 'expanded')
-            
-            # 점수 순으로 정렬 및 유사도 임계값 필터링
-            # 혁신적 개선: 원본 쿼리 매칭 결과를 우선 정렬
-            sorted_candidates = sorted(
-                all_candidates.items(), 
-                key=lambda x: (x[1][1] == 'original', x[1][0]),  # 원본 쿼리 매칭 우선, 그 다음 점수
-                reverse=True
-            )
-            
-            # 유사도 임계값 이상인 결과만 필터링
-            filtered_candidates = [
-                (item_id, float(score)) for item_id, (score, _) in sorted_candidates
-                if float(score) >= SIMILARITY_THRESHOLD
-            ]
-            
-            # 최소 결과 수 보장 (임계값을 만족하는 결과가 적어도 최소 개수는 반환)
-            if len(filtered_candidates) < MIN_RESULTS_TO_RETURN and len(sorted_candidates) > 0:
-                # 임계값을 만족하는 결과가 적으면 상위 결과를 포함 (최소 개수 보장)
-                filtered_candidates = [
-                    (item_id, float(score)) for item_id, (score, _) in sorted_candidates[:max(MIN_RESULTS_TO_RETURN, top_k)]
-                ]
-            
-            item_ids = [item_id for item_id, _ in filtered_candidates[:top_k]]
-            scores = [float(score) for _, score in filtered_candidates[:top_k]]  # 명시적으로 Python float로 변환
-        else:
-            # 단일 쿼리 검색
-            debug_pairs = [
-                (int(idx), float(dist))
-                for idx, dist in zip(indices[0], distances[0])
-                if idx != -1
-            ]
-            print(f"📈 검색 디버그: query='{query[:50]}', 결과={debug_pairs}")
-            
-            # FAISS 인덱스 번호 → MySQL item_id 변환 및 유사도 임계값 필터링
+        # FAISS 인덱스 번호 → MySQL item_id 변환 및 유사도 임계값 필터링
+        item_ids = []
+        scores = []
+        for idx, dist in zip(indices[0], distances[0]):
+            if int(idx) != -1 and int(idx) in id_mapping:
+                score = float(dist)  # IndexFlatIP이므로 내적 값 (높을수록 유사)
+                # 유사도 임계값 이상인 결과만 포함
+                if score >= SIMILARITY_THRESHOLD:
+                    item_ids.append(id_mapping[int(idx)])
+                    scores.append(score)
+        
+        # 최소 결과 수 보장 (임계값을 만족하는 결과가 적어도 최소 개수는 반환)
+        if len(item_ids) < MIN_RESULTS_TO_RETURN:
+            # 임계값 미만이어도 상위 결과를 포함 (최소 개수 보장)
             item_ids = []
             scores = []
             for idx, dist in zip(indices[0], distances[0]):
                 if int(idx) != -1 and int(idx) in id_mapping:
-                    score = float(dist)  # IndexFlatIP이므로 내적 값 (높을수록 유사)
-                    # 유사도 임계값 이상인 결과만 포함
-                    if score >= SIMILARITY_THRESHOLD:
-                        item_ids.append(id_mapping[int(idx)])
-                        scores.append(score)
-            
-            # 최소 결과 수 보장 (임계값을 만족하는 결과가 적어도 최소 개수는 반환)
-            if len(item_ids) < MIN_RESULTS_TO_RETURN:
-                # 임계값 미만이어도 상위 결과를 포함 (최소 개수 보장)
-                item_ids = []
-                scores = []
-                for idx, dist in zip(indices[0], distances[0]):
-                    if int(idx) != -1 and int(idx) in id_mapping:
-                        item_ids.append(id_mapping[int(idx)])
-                        scores.append(float(dist))
-                        if len(item_ids) >= MIN_RESULTS_TO_RETURN:
-                            break
-            
-            # top_k만큼만 반환
-            item_ids = item_ids[:top_k]
-            scores = scores[:top_k]
+                    item_ids.append(id_mapping[int(idx)])
+                    scores.append(float(dist))
+                    if len(item_ids) >= max(MIN_RESULTS_TO_RETURN, top_k):
+                        break
         
-        # 디버깅: 유사도 점수와 함께 출력
-        result_pairs = list(zip(item_ids[:10], scores[:10]))
-        filtered_count = len([s for s in scores if s >= SIMILARITY_THRESHOLD])
-        print(f"🔍 자연어 검색 완료: query='{query[:30]}...', top_k={top_k}, 결과={len(item_ids)}개")
-        print(f"📊 유사도 임계값: {SIMILARITY_THRESHOLD}, 임계값 이상: {filtered_count}개")
-        print(f"📊 상위 10개 유사도 점수: {result_pairs[:10]}")
+        # top_k만큼만 반환
+        item_ids = item_ids[:top_k]
+        scores = scores[:top_k]
+        
         
         # 안전장치: 모든 scores를 Python float로 강제 변환 (numpy 타입 방지)
         safe_scores = []

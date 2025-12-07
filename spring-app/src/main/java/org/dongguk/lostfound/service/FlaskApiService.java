@@ -145,10 +145,12 @@ public class FlaskApiService {
                 return new SearchResult(longItemIds, doubleScores);
             }
             
+            log.error("Flask AI 서버 응답 실패: success=false, response={}", response);
             throw new RuntimeException("Failed to search embeddings: " + response);
             
         } catch (Exception e) {
-            log.warn("Flask AI 서버에 연결할 수 없습니다. 빈 결과를 반환합니다. query: {}", query);
+            log.error("Flask AI 서버에 연결할 수 없습니다. 빈 결과를 반환합니다. query: '{}', 에러: {}", 
+                    query, e.getMessage(), e);
             // Flask 서버가 꺼져있을 때 빈 리스트 반환 (fallback)
             return new SearchResult(new ArrayList<>(), new ArrayList<>());
         }

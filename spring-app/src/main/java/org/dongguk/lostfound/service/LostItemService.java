@@ -511,16 +511,43 @@ public class LostItemService {
         
         // 병렬 실행을 위한 CompletableFuture 사용
         CompletableFuture<List<LostItem>> keywordSearchFuture = 
-                CompletableFuture.supplyAsync(() -> 
-                        searchByKeyword(searchQuery, request, finalLocationRadius));
+                CompletableFuture.supplyAsync(() -> {
+                    try {
+                        log.debug("키워드 검색 시작: query='{}'", searchQuery);
+                        List<LostItem> result = searchByKeyword(searchQuery, request, finalLocationRadius);
+                        log.info("키워드 검색 완료: {}개 결과", result.size());
+                        return result;
+                    } catch (Exception e) {
+                        log.error("키워드 검색 실패: {}", e.getMessage(), e);
+                        return List.<LostItem>of(); // 빈 리스트 반환
+                    }
+                });
         
         CompletableFuture<FlaskApiService.SearchResult> semanticSearchFuture = 
-                CompletableFuture.supplyAsync(() -> 
-                        flaskApiService.searchSimilarItemsWithScores(searchQuery, semanticSearchTopK));
+                CompletableFuture.supplyAsync(() -> {
+                    try {
+                        log.debug("시맨틱 검색 시작: query='{}', topK={}", searchQuery, semanticSearchTopK);
+                        FlaskApiService.SearchResult result = flaskApiService.searchSimilarItemsWithScores(searchQuery, semanticSearchTopK);
+                        log.info("시맨틱 검색 완료: {}개 결과", result.getItemIds().size());
+                        return result;
+                    } catch (Exception e) {
+                        log.error("시맨틱 검색 실패: {}", e.getMessage(), e);
+                        return new FlaskApiService.SearchResult(List.of(), List.of()); // 빈 결과 반환
+                    }
+                });
         
-        // 두 검색 결과를 모두 기다림
-        List<LostItem> keywordMatchedItems = keywordSearchFuture.join();
-        FlaskApiService.SearchResult searchResult = semanticSearchFuture.join();
+        // 두 검색 결과를 모두 기다림 (예외 처리 포함)
+        List<LostItem> keywordMatchedItems;
+        FlaskApiService.SearchResult searchResult;
+        try {
+            keywordMatchedItems = keywordSearchFuture.join();
+            searchResult = semanticSearchFuture.join();
+        } catch (Exception e) {
+            log.error("검색 실행 중 예외 발생: {}", e.getMessage(), e);
+            // 예외 발생 시 빈 결과 반환
+            keywordMatchedItems = List.of();
+            searchResult = new FlaskApiService.SearchResult(List.of(), List.of());
+        }
         
         Set<Long> keywordMatchedIds = keywordMatchedItems.stream()
                 .map(LostItem::getId)
@@ -531,6 +558,13 @@ public class LostItemService {
         
         log.info("키워드 매칭 결과: {}개, 시맨틱 검색 결과: {}개 (검색어: '{}')", 
                 keywordMatchedItems.size(), semanticItemIds.size(), searchQuery);
+        
+        // 검색 결과가 비어있을 때 경고 로그 출력
+        if (keywordMatchedItems.isEmpty() && semanticItemIds.isEmpty()) {
+            log.warn("⚠️ 검색 결과가 비어있습니다. 검색어: '{}', 필터: location={}, locations={}, locationRadius={}, category={}, brand={}", 
+                    searchQuery, request.location(), request.locations(), request.locationRadius(), 
+                    request.category(), request.brand());
+        }
 
         // 2. 점수 기반 필터링을 먼저 수행하여 불필요한 DB 조회 방지
         double scoreThreshold = 0.3;
@@ -578,22 +612,33 @@ public class LostItemService {
         log.info("필터 적용 여부: {}, 필터 조건: category={}, location={}, locations={}, locationRadius={}, brand={}, foundDateAfter={}", 
                 hasFilters, request.category(), request.location(), request.locations(), request.locationRadius(), request.brand(), request.foundDateAfter());
         
-        List<LostItem> filteredItems = combinedItems.stream()
-                .filter(item -> {
-                    if (!hasFilters) {
-                        return true; // 필터가 없으면 모두 통과
-                    }
-                    boolean matches = matchesFilters(item, request, finalLocationPlaceResults, finalLocationRadius);
-                    if (!matches) {
-                        log.debug("아이템 필터링 제외: itemId={}, itemName={}, category={}, brand={}, location={}", 
-                                item.getId(), item.getItemName(), item.getCategory(), item.getBrand(), item.getLocation());
-                    }
-                    return matches;
-                })
-                .toList();
+        List<LostItem> filteredItems;
+        if (!hasFilters) {
+            // 필터가 없으면 모두 통과
+            filteredItems = combinedItems;
+        } else {
+            // 필터가 있으면 필터링 적용
+            filteredItems = combinedItems.stream()
+                    .filter(item -> {
+                        boolean matches = matchesFilters(item, request, finalLocationPlaceResults, finalLocationRadius);
+                        if (!matches) {
+                            log.debug("아이템 필터링 제외: itemId={}, itemName={}, category={}, brand={}, location={}", 
+                                    item.getId(), item.getItemName(), item.getCategory(), item.getBrand(), item.getLocation());
+                        }
+                        return matches;
+                    })
+                    .toList();
+        }
         
         log.info("필터 적용 전: {}개 (키워드: {}, 시맨틱: {}), 필터 적용 후: {}개", 
                 combinedItems.size(), keywordMatchedItems.size(), scoredSemanticItems.size(), filteredItems.size());
+        
+        // 필터 적용 후 결과가 비어있을 때 경고 로그 출력
+        if (combinedItems.size() > 0 && filteredItems.isEmpty()) {
+            log.warn("⚠️ 필터 적용 후 모든 결과가 제외되었습니다. 필터 조건: location={}, locations={}, locationRadius={}, category={}, brand={}, foundDateAfter={}", 
+                    request.location(), request.locations(), request.locationRadius(), 
+                    request.category(), request.brand(), request.foundDateAfter());
+        }
         
         // 8. 페이지네이션 적용
         int totalCount = filteredItems.size();
@@ -647,7 +692,7 @@ public class LostItemService {
     
     /**
      * 키워드 기반 검색 (제목/설명/브랜드에 검색어 포함)
-     * 성능 최적화: DB 레벨에서 정렬 및 제한, 메모리 필터링 최소화
+     * 필터는 적용하지 않음 (나중에 통합 필터링에서 처리)
      */
     private List<LostItem> searchByKeyword(String keyword, SearchLostItemRequest request, Double locationRadius) {
         if (keyword == null || keyword.trim().isEmpty()) {
@@ -664,40 +709,7 @@ public class LostItemService {
                 .replace("_", "!_");
         String pattern = "%" + escapedKeyword + "%";
         
-        // 장소 필터링을 위한 좌표 미리 계산 (메모리 필터링 최소화)
-        // 여러 장소가 있으면 모든 장소를 변환 (메모리 레벨 필터링용)
-        List<TmapApiService.TmapPlaceResult> locationPlaceResults = new java.util.ArrayList<>();
-        TmapApiService.TmapPlaceResult locationPlaceResult = null; // DB 레벨 필터링용 (첫 번째 장소)
-        double radius = locationRadius != null ? locationRadius : 10000.0; // 기본값 10km
-        
-        // 여러 장소가 있는 경우 모든 장소 변환
-        if (request.locations() != null && !request.locations().isEmpty()) {
-            for (String loc : request.locations()) {
-                if (loc != null && !loc.trim().isEmpty()) {
-                    TmapApiService.TmapPlaceResult placeResult = tmapApiService.searchPlace(loc.trim());
-                    if (placeResult != null) {
-                        locationPlaceResults.add(placeResult);
-                        // 첫 번째 장소는 DB 레벨 필터링용으로 사용
-                        if (locationPlaceResult == null) {
-                            locationPlaceResult = placeResult;
-                        }
-                    }
-                }
-            }
-        } 
-        // 단일 장소가 있는 경우
-        else if (request.location() != null && !request.location().trim().isEmpty()) {
-            locationPlaceResult = tmapApiService.searchPlace(request.location().trim());
-            if (locationPlaceResult != null) {
-                locationPlaceResults.add(locationPlaceResult);
-            }
-        }
-        
-        final TmapApiService.TmapPlaceResult finalLocationPlaceResult = locationPlaceResult; // DB 레벨 필터링용
-        final List<TmapApiService.TmapPlaceResult> finalLocationPlaceResults = locationPlaceResults; // 메모리 레벨 필터링용
-        final double finalLocationRadius = radius;
-        
-        // Specification 생성: 모든 필터를 한 번에 적용
+        // 키워드 매칭만 수행 (필터는 나중에 통합 필터링에서 처리)
         Specification<LostItem> spec = (root, query, cb) -> {
             List<Predicate> predicates = new java.util.ArrayList<>();
             
@@ -711,58 +723,6 @@ public class LostItemService {
                     )
             ));
             
-            // 카테고리 필터
-            if (request.category() != null) {
-                predicates.add(cb.equal(root.get("category"), request.category()));
-            }
-            
-            // 날짜 필터
-            if (request.foundDateAfter() != null) {
-                predicates.add(cb.greaterThanOrEqualTo(root.get("foundDate"), request.foundDateAfter()));
-            }
-            
-            // 브랜드 필터 (키워드와 별도로 브랜드 필터가 있는 경우)
-            if (request.brand() != null && !request.brand().trim().isEmpty()) {
-                String brandFilter = request.brand().toLowerCase().trim();
-                String brandPattern = "%" + brandFilter
-                        .replace("!", "!!")
-                        .replace("%", "!%")
-                        .replace("_", "!_") + "%";
-                predicates.add(cb.or(
-                        cb.like(cb.lower(root.get("itemName")), brandPattern, escapeChar),
-                        cb.like(cb.lower(root.get("description")), brandPattern, escapeChar),
-                        cb.and(
-                                cb.isNotNull(root.get("brand")),
-                                cb.like(cb.lower(root.get("brand")), brandPattern, escapeChar)
-                        )
-                ));
-            }
-            
-            // 장소 필터 (좌표 기반 - 대략적인 범위로 먼저 필터링)
-            if (finalLocationPlaceResult != null) {
-                // 대략적인 반경 계산 (1도 ≈ 111km)
-                double radiusInDegrees = finalLocationRadius / 111000.0;
-                predicates.add(cb.and(
-                        cb.isNotNull(root.get("latitude")),
-                        cb.isNotNull(root.get("longitude")),
-                        cb.between(root.get("latitude"), 
-                                finalLocationPlaceResult.getLatitude() - radiusInDegrees,
-                                finalLocationPlaceResult.getLatitude() + radiusInDegrees),
-                        cb.between(root.get("longitude"),
-                                finalLocationPlaceResult.getLongitude() - radiusInDegrees,
-                                finalLocationPlaceResult.getLongitude() + radiusInDegrees)
-                ));
-            } else if (request.location() != null && !request.location().trim().isEmpty() && locationRadius == null) {
-                // 좌표 변환 실패 시 문자열 일치 방식으로 폴백 (거리 필터가 없는 경우에만)
-                String locationKeyword = request.location().toLowerCase().trim();
-                String locationPattern = "%" + locationKeyword
-                        .replace("!", "!!")
-                        .replace("%", "!%")
-                        .replace("_", "!_") + "%";
-                predicates.add(cb.like(cb.lower(root.get("location")), locationPattern, escapeChar));
-            }
-            // 거리 필터가 설정된 경우 좌표 변환 실패하면 필터링 실패 (문자열 폴백 없음)
-            
             return cb.and(predicates.toArray(new Predicate[0]));
         };
         
@@ -771,32 +731,6 @@ public class LostItemService {
         Page<LostItem> itemPage = lostItemRepository.findAll(spec, pageable);
         List<LostItem> items = itemPage.getContent();
         
-        // 좌표 기반 필터링이 있는 경우: 정확한 거리 계산으로 재필터링 (DB에서 대략적으로 필터링된 후)
-        // 여러 장소가 있으면 OR 조건 (하나라도 만족하면 통과)
-        if (!finalLocationPlaceResults.isEmpty()) {
-            items = items.stream()
-                    .filter(item -> {
-                        if (item.getLatitude() == null || item.getLongitude() == null) {
-                            return false; // 좌표가 없으면 필터링 실패
-                        }
-                        
-                        // 여러 장소 중 하나라도 반경 내에 있으면 통과
-                        for (TmapApiService.TmapPlaceResult placeResult : finalLocationPlaceResults) {
-                            if (placeResult != null) {
-                                double distance = calculateHaversineDistance(
-                                        placeResult.getLatitude(), placeResult.getLongitude(),
-                                        item.getLatitude(), item.getLongitude()
-                                );
-                                if (distance <= finalLocationRadius) {
-                                    return true; // 하나라도 만족하면 통과
-                                }
-                            }
-                        }
-                        return false; // 모든 장소에서 반경 밖이면 실패
-                    })
-                    .toList();
-        }
-        
         return items;
     }
 
@@ -804,9 +738,11 @@ public class LostItemService {
      * 필터가 있는지 확인
      */
     private boolean hasFilters(SearchLostItemRequest request) {
+        boolean hasLocation = (request.location() != null && !request.location().trim().isEmpty())
+                || (request.locations() != null && !request.locations().isEmpty());
+        // locationRadius만 있고 장소명이 없으면 필터로 간주하지 않음 (필터링 불가능)
         return request.category() != null
-                || (request.location() != null && !request.location().trim().isEmpty())
-                || (request.locations() != null && !request.locations().isEmpty())
+                || hasLocation
                 || (request.brand() != null && !request.brand().trim().isEmpty())
                 || request.foundDateAfter() != null;
     }
@@ -836,8 +772,8 @@ public class LostItemService {
         boolean hasLocationFilter = (request.locations() != null && !request.locations().isEmpty()) ||
                                     (request.location() != null && !request.location().trim().isEmpty());
         
+        // locationRadius만 있고 장소명이 없으면 필터링 불가능하므로 통과
         if (!hasLocationFilter) {
-            // 장소 필터가 없으면 통과
             locationMatches = true;
         }
         // 여러 장소가 있는 경우
@@ -1152,6 +1088,7 @@ public class LostItemService {
             }
         }
 
+        // 모든 필터를 통과했으면 true 반환
         return true;
     }
 
