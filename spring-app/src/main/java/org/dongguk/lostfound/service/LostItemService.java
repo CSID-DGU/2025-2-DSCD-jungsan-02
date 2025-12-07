@@ -611,18 +611,31 @@ public class LostItemService {
         if (!filteredSemanticIds.isEmpty()) {
             // 배치 크기: MySQL IN 절 제한 고려 (일반적으로 1000개 이하 권장)
             int batchSize = 500;
+            Map<Long, LostItem> itemMap = new java.util.HashMap<>();
             for (int i = 0; i < filteredSemanticIds.size(); i += batchSize) {
                 int end = Math.min(i + batchSize, filteredSemanticIds.size());
                 List<Long> batchIds = filteredSemanticIds.subList(i, end);
                 List<LostItem> batchItems = lostItemRepository.findAllById(batchIds);
-                scoredSemanticItems.addAll(batchItems);
+                // Map에 저장하여 ID로 빠르게 조회 가능하게 함
+                for (LostItem item : batchItems) {
+                    itemMap.put(item.getId(), item);
+                }
+            }
+            
+            // FAISS에서 반환된 순서(유사도 점수 순서)대로 정렬하여 추가
+            // filteredSemanticIds는 이미 유사도 점수 순서대로 정렬되어 있음
+            for (Long itemId : filteredSemanticIds) {
+                LostItem item = itemMap.get(itemId);
+                if (item != null) {
+                    scoredSemanticItems.add(item);
+                }
             }
         }
 
         // 6. 키워드 매칭 결과와 시맨틱 검색 결과 합치기 (키워드 매칭이 우선)
         List<LostItem> combinedItems = new java.util.ArrayList<>();
         combinedItems.addAll(keywordMatchedItems); // 키워드 매칭 결과를 먼저 추가
-        combinedItems.addAll(scoredSemanticItems);  // 시맨틱 검색 결과 추가
+        combinedItems.addAll(scoredSemanticItems);  // 시맨틱 검색 결과 추가 (유사도 점수 순서 유지)
         
         // 7. 필터 적용 (hasFilters는 이미 510번 줄에서 선언됨)
         log.info("필터 적용 여부: {}, 필터 조건: category={}, location={}, locations={}, locationRadius={}, brand={}, foundDateAfter={}", 
