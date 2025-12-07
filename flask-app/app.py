@@ -1025,13 +1025,17 @@ def search_embedding():
         
         # FAISS 인덱스가 비어있으면 빈 결과 반환
         if faiss_index is None or faiss_index.ntotal == 0:
-            return jsonify({'success': True, 'item_ids': []})
+            print(f"❌ FAISS 인덱스 비어있음: ntotal={faiss_index.ntotal if faiss_index else 0}, id_mapping={len(id_mapping)}")
+            return jsonify({'success': True, 'item_ids': [], 'scores': []})
         
         # 1. 검색어를 임베딩 벡터로 변환 (BGE-M3 사용, 캐시 활용)
         query_vector = create_embedding_vector(query, use_cache=True)
         
         # 2. FAISS에서 코사인 유사도 기반 Top-K 검색
         k = min(top_k * 3, faiss_index.ntotal)
+        if k == 0:
+            print(f"❌ k=0: top_k={top_k}, ntotal={faiss_index.ntotal}")
+            return jsonify({'success': True, 'item_ids': [], 'scores': []})
         
         # HNSW 인덱스인 경우 ef_search 파라미터 설정
         if hasattr(faiss_index, 'hnsw'):
@@ -1040,19 +1044,31 @@ def search_embedding():
         # 검색 실행
         distances, indices = faiss_index.search(np.array([query_vector]), k)
         
+        valid_results = len([idx for idx in indices[0] if int(idx) != -1])
+        if valid_results == 0:
+            print(f"❌ FAISS 검색 결과 없음: k={k}, ntotal={faiss_index.ntotal}, id_mapping={len(id_mapping)}")
+            return jsonify({'success': True, 'item_ids': [], 'scores': []})
+        
         # FAISS 인덱스 번호 → MySQL item_id 변환 및 유사도 임계값 필터링
         item_ids = []
         scores = []
+        threshold_passed = 0
+        mapping_missing = 0
+        
         for idx, dist in zip(indices[0], distances[0]):
-            if int(idx) != -1 and int(idx) in id_mapping:
-                score = float(dist)  # IndexFlatIP이므로 내적 값 (높을수록 유사)
-                # 유사도 임계값 이상인 결과만 포함
-                if score >= SIMILARITY_THRESHOLD:
-                    item_ids.append(id_mapping[int(idx)])
-                    scores.append(score)
+            if int(idx) != -1:
+                if int(idx) in id_mapping:
+                    score = float(dist)  # IndexFlatIP이므로 내적 값 (높을수록 유사)
+                    # 유사도 임계값 이상인 결과만 포함
+                    if score >= SIMILARITY_THRESHOLD:
+                        threshold_passed += 1
+                        item_ids.append(id_mapping[int(idx)])
+                        scores.append(score)
+                else:
+                    mapping_missing += 1
         
         # 최소 결과 수 보장 (임계값을 만족하는 결과가 적어도 최소 개수는 반환)
-        if len(item_ids) < MIN_RESULTS_TO_RETURN:
+        if len(item_ids) < MIN_RESULTS_TO_RETURN and valid_results > 0:
             # 임계값 미만이어도 상위 결과를 포함 (최소 개수 보장)
             item_ids = []
             scores = []
@@ -1060,8 +1076,11 @@ def search_embedding():
                 if int(idx) != -1 and int(idx) in id_mapping:
                     item_ids.append(id_mapping[int(idx)])
                     scores.append(float(dist))
-                    if len(item_ids) >= max(MIN_RESULTS_TO_RETURN, top_k):
+                    if len(item_ids) >= top_k:
                         break
+            print(f"⚠️ 임계값 미만 결과 포함: {len(item_ids)}개 (임계값={SIMILARITY_THRESHOLD}, 유효결과={valid_results}, 매핑없음={mapping_missing})")
+        else:
+            print(f"✅ 검색 완료: {len(item_ids)}개 (임계값 통과={threshold_passed}, 유효결과={valid_results}, 매핑없음={mapping_missing})")
         
         # top_k만큼만 반환
         item_ids = item_ids[:top_k]
