@@ -97,14 +97,39 @@ jobs:
           key: ${{ secrets.PRIVATE_KEY }}
           script: |
             cd /home/mj/lostfound
-            docker compose down || true
+            
+            # FAISS 데이터 디렉토리 보존을 위해 볼륨 제거 없이 컨테이너만 중지
+            # docker compose down -v를 사용하지 않음 (볼륨 보존)
+            docker compose stop || true
             
             # 기존 이미지만 정리 (전체 시스템 정리는 너무 오래 걸림)
             docker image prune -f || true
+            
+            # FAISS 데이터 디렉토리 생성 및 권한 확인 (절대 경로 사용)
+            mkdir -p /home/mj/lostfound/faiss-data
+            mkdir -p /home/mj/lostfound/hf-cache
+            chmod -R 755 /home/mj/lostfound/faiss-data
+            chmod -R 755 /home/mj/lostfound/hf-cache
+            
+            # 기존 FAISS 데이터 백업 (안전장치)
+            if [ -d "/home/mj/lostfound/faiss-data" ] && [ "$(ls -A /home/mj/lostfound/faiss-data)" ]; then
+              echo "✅ FAISS 데이터 디렉토리 존재 및 데이터 확인됨"
+              ls -lah /home/mj/lostfound/faiss-data/ | head -10
+            else
+              echo "⚠️ FAISS 데이터 디렉토리가 비어있습니다"
+            fi
             
             # 이미지를 병렬로 개별 pull (docker compose pull보다 빠름)
             docker pull ${{ secrets.DOCKER_USERNAME }}/lostfound-flask:latest &
             docker pull ${{ secrets.DOCKER_USERNAME }}/lostfound-spring:latest &
             wait
             
+            # 컨테이너 재시작 (볼륨은 유지됨)
             docker compose up -d --remove-orphans
+            
+            # 배포 후 FAISS 데이터 디렉토리 확인
+            echo "=== 배포 후 FAISS 데이터 디렉토리 상태 ==="
+            ls -lah /home/mj/lostfound/faiss-data/ || echo "⚠️ FAISS 디렉토리가 비어있습니다"
+            
+            # 컨테이너 내부에서도 확인
+            docker exec flask-app ls -lah /app/faiss-data/ 2>/dev/null || echo "⚠️ 컨테이너 내부 FAISS 디렉토리 확인 실패"

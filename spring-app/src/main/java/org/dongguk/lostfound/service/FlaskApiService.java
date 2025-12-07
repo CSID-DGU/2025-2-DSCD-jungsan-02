@@ -104,11 +104,15 @@ public class FlaskApiService {
      * Flask AI 서버에 검색 요청 (item_id 리스트와 점수 반환)
      */
     public SearchResult searchSimilarItemsWithScores(String query, Integer topK) {
+        log.info("🔍 Flask AI 서버 검색 요청 시작: query='{}', topK={}", query, topK);
+        
         try {
             Map<String, Object> request = Map.of(
-                    "query", query,
+                    "query", query != null ? query : "",
                     "top_k", topK != null ? topK : 10
             );
+            
+            log.debug("Flask 요청 데이터: {}", request);
 
             Map<String, Object> response = flaskRestClient.post()
                     .uri("/api/v1/embedding/search")
@@ -117,41 +121,89 @@ public class FlaskApiService {
                     .retrieve()
                     .body(Map.class);
 
-            if (response != null && Boolean.TRUE.equals(response.get("success"))) {
-                List<Integer> itemIds = (List<Integer>) response.get("item_ids");
-                List<Double> scores = (List<Double>) response.get("scores");
+            log.info("Flask 응답 수신: response={}", response);
+
+            if (response == null) {
+                log.error("❌ Flask AI 서버 응답이 null입니다. query: '{}'", query);
+                return new SearchResult(new ArrayList<>(), new ArrayList<>());
+            }
+
+            if (Boolean.TRUE.equals(response.get("success"))) {
+                // 응답 파싱: 타입 안전하게 처리
+                Object itemIdsObj = response.get("item_ids");
+                Object scoresObj = response.get("scores");
                 
-                List<Long> longItemIds = itemIds != null ? 
-                        itemIds.stream().map(Long::valueOf).toList() : 
-                        new ArrayList<>();
-                List<Double> doubleScores = scores != null ? 
-                        scores : 
-                        new ArrayList<>();
+                List<Long> longItemIds = new ArrayList<>();
+                List<Double> doubleScores = new ArrayList<>();
+                
+                // item_ids 파싱 (Integer 또는 Long 모두 처리)
+                if (itemIdsObj instanceof List) {
+                    List<?> itemIdsList = (List<?>) itemIdsObj;
+                    for (Object id : itemIdsList) {
+                        if (id instanceof Integer) {
+                            longItemIds.add(((Integer) id).longValue());
+                        } else if (id instanceof Long) {
+                            longItemIds.add((Long) id);
+                        } else if (id instanceof Number) {
+                            longItemIds.add(((Number) id).longValue());
+                        }
+                    }
+                }
+                
+                // scores 파싱
+                if (scoresObj instanceof List) {
+                    List<?> scoresList = (List<?>) scoresObj;
+                    for (Object score : scoresList) {
+                        if (score instanceof Double) {
+                            doubleScores.add((Double) score);
+                        } else if (score instanceof Number) {
+                            doubleScores.add(((Number) score).doubleValue());
+                        }
+                    }
+                }
+                
+                log.info("✅ Flask 검색 성공: {}개 결과 (query: '{}')", longItemIds.size(), query);
                 
                 // 디버깅: 유사도 점수 확인
                 if (!doubleScores.isEmpty()) {
-                    log.info("Flask 검색 결과 - 상위 10개 유사도 점수: {}", 
+                    log.debug("Flask 검색 결과 - 상위 10개 유사도 점수: {}", 
                             doubleScores.stream()
                                     .limit(10)
                                     .map(score -> String.format("%.4f", score))
                                     .collect(Collectors.joining(", ")));
                     double maxScore = doubleScores.stream().mapToDouble(Double::doubleValue).max().orElse(0.0);
                     double minScore = doubleScores.stream().mapToDouble(Double::doubleValue).min().orElse(0.0);
-                    log.info("Flask 검색 결과 - 점수 범위: 최고={}, 최저={}", 
+                    log.debug("Flask 검색 결과 - 점수 범위: 최고={}, 최저={}", 
                             String.format("%.4f", maxScore),
                             String.format("%.4f", minScore));
+                } else {
+                    log.warn("⚠️ Flask 검색 결과: item_ids는 {}개인데 scores가 비어있습니다.", longItemIds.size());
                 }
                 
                 return new SearchResult(longItemIds, doubleScores);
+            } else {
+                // success=false인 경우
+                Object message = response.get("message");
+                log.error("❌ Flask AI 서버 응답 실패: success=false, message={}, response={}", 
+                        message, response);
+                return new SearchResult(new ArrayList<>(), new ArrayList<>());
             }
             
-            log.error("Flask AI 서버 응답 실패: success=false, response={}", response);
-            throw new RuntimeException("Failed to search embeddings: " + response);
-            
-        } catch (Exception e) {
-            log.error("Flask AI 서버에 연결할 수 없습니다. 빈 결과를 반환합니다. query: '{}', 에러: {}", 
+        } catch (org.springframework.web.client.RestClientException e) {
+            log.error("❌ Flask AI 서버 연결 실패 (RestClientException): query='{}', 에러: {}", 
                     query, e.getMessage(), e);
-            // Flask 서버가 꺼져있을 때 빈 리스트 반환 (fallback)
+            // 네트워크 오류 등으로 연결 실패 시 빈 결과 반환
+            return new SearchResult(new ArrayList<>(), new ArrayList<>());
+        } catch (ClassCastException e) {
+            log.error("❌ Flask 응답 파싱 실패 (타입 불일치): query='{}', 에러: {}", 
+                    query, e.getMessage(), e);
+            e.printStackTrace();
+            return new SearchResult(new ArrayList<>(), new ArrayList<>());
+        } catch (Exception e) {
+            log.error("❌ Flask AI 서버 요청 중 예외 발생: query='{}', 에러 타입: {}, 메시지: {}", 
+                    query, e.getClass().getName(), e.getMessage(), e);
+            e.printStackTrace();
+            // 예상치 못한 예외 발생 시 빈 리스트 반환 (fallback)
             return new SearchResult(new ArrayList<>(), new ArrayList<>());
         }
     }

@@ -526,12 +526,16 @@ public class LostItemService {
         CompletableFuture<FlaskApiService.SearchResult> semanticSearchFuture = 
                 CompletableFuture.supplyAsync(() -> {
                     try {
-                        log.debug("시맨틱 검색 시작: query='{}', topK={}", searchQuery, semanticSearchTopK);
+                        log.info("🔍 시맨틱 검색 시작: query='{}', topK={}", searchQuery, semanticSearchTopK);
                         FlaskApiService.SearchResult result = flaskApiService.searchSimilarItemsWithScores(searchQuery, semanticSearchTopK);
-                        log.info("시맨틱 검색 완료: {}개 결과", result.getItemIds().size());
+                        log.info("✅ 시맨틱 검색 완료: {}개 결과 (query: '{}')", result.getItemIds().size(), searchQuery);
+                        if (result.getItemIds().isEmpty()) {
+                            log.warn("⚠️ 시맨틱 검색 결과가 비어있습니다. query: '{}', topK: {}", searchQuery, semanticSearchTopK);
+                        }
                         return result;
                     } catch (Exception e) {
-                        log.error("시맨틱 검색 실패: {}", e.getMessage(), e);
+                        log.error("❌ 시맨틱 검색 실패: query='{}', 에러: {}", searchQuery, e.getMessage(), e);
+                        e.printStackTrace();
                         return new FlaskApiService.SearchResult(List.of(), List.of()); // 빈 결과 반환
                     }
                 });

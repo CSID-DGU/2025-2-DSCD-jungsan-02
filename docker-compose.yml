@@ -22,8 +22,9 @@ services:
       # CUDA 메모리 할당 전략
       CUDA_LAUNCH_BLOCKING: "0"  # 비동기 실행으로 성능 향상 
     volumes:
-      - ./faiss-data:/app/faiss-data
-      - ./hf-cache:/app/hf-cache  # HuggingFace 모델 캐시를 호스트에 저장하여 컨테이너 내부 공간 절약
+      # 절대 경로 사용으로 변경 (볼륨 마운트 안정성 향상)
+      - /home/mj/lostfound/faiss-data:/app/faiss-data
+      - /home/mj/lostfound/hf-cache:/app/hf-cache  # HuggingFace 모델 캐시를 호스트에 저장하여 컨테이너 내부 공간 절약
     networks:
       - backend
 

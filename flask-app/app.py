@@ -618,10 +618,64 @@ def warmup_models():
 
 
 models_warmed = False
+
+def check_and_recover_faiss():
+    """FAISS 인덱스가 비어있으면 Spring 서버에 요청하여 복구 시도"""
+    global faiss_index, id_mapping
+    
+    if faiss_index is None or faiss_index.ntotal == 0:
+        print(f"⚠️ FAISS 인덱스가 비어있습니다 (ntotal={faiss_index.ntotal if faiss_index else 0})")
+        print(f"🔄 Spring 서버에 복구 요청을 시도합니다...")
+        
+        # Spring 서버 URL (환경 변수로 설정 가능)
+        spring_server_url = os.getenv("SPRING_SERVER_URL", "http://spring-app:8080")
+        
+        try:
+            # Spring 서버의 동기화 API 호출하여 DB의 모든 item_id 조회
+            # 이 API는 FAISS에 없는 항목들을 재생성하도록 Spring 서버에 요청
+            sync_url = f"{spring_server_url}/api/v1/admin/faiss/recover"
+            
+            print(f"📡 Spring 서버에 복구 요청: {sync_url}")
+            response = requests.post(
+                sync_url,
+                timeout=30,
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                print(f"✅ Spring 서버 복구 응답: {result}")
+                # 복구 후 다시 FAISS 로드 시도
+                time.sleep(2)  # 복구 완료 대기
+                initialize_faiss()
+                if faiss_index and faiss_index.ntotal > 0:
+                    print(f"✅ FAISS 복구 완료: {faiss_index.ntotal}개 벡터")
+                else:
+                    print(f"⚠️ FAISS 복구 후에도 여전히 비어있습니다")
+            else:
+                print(f"⚠️ Spring 서버 복구 요청 실패: {response.status_code}, {response.text}")
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ Spring 서버 연결 실패 (복구 스킵): {e}")
+            print(f"   Spring 서버 URL: {spring_server_url}")
+            print(f"   이는 정상일 수 있습니다 (Spring 서버가 아직 시작되지 않았거나 네트워크 문제)")
+        except Exception as e:
+            print(f"⚠️ FAISS 복구 중 예외 발생: {e}")
+            import traceback
+            traceback.print_exc()
+
 # 각 워커 시작 시 모델과 FAISS 미리 로드
 # 예외가 발생해도 앱이 시작될 수 있도록 try-except 처리
 try:
     initialize_faiss()
+    
+    # FAISS가 비어있으면 복구 시도 (백그라운드 스레드에서 실행)
+    if faiss_index is None or faiss_index.ntotal == 0:
+        print(f"⚠️ FAISS 인덱스가 비어있습니다. 백그라운드에서 복구를 시도합니다...")
+        # 백그라운드 스레드에서 복구 시도 (앱 시작을 블로킹하지 않음)
+        recovery_thread = threading.Thread(target=check_and_recover_faiss, daemon=True)
+        recovery_thread.start()
+        print(f"✅ 복구 스레드 시작됨 (백그라운드 실행)")
+    
 except Exception as e:
     print(f"⚠️ FAISS 초기화 실패 (앱은 계속 시작됩니다): {e}")
     import traceback
@@ -637,6 +691,10 @@ except Exception as e:
         id_mapping = {}
         _faiss_initialized = True
         print(f"✅ 빈 FAISS 인덱스로 시작합니다.")
+        
+        # 빈 인덱스로 시작했으므로 복구 시도
+        recovery_thread = threading.Thread(target=check_and_recover_faiss, daemon=True)
+        recovery_thread.start()
 
 try:
     warmup_models()
@@ -1000,9 +1058,22 @@ def search_embedding():
     - 하이브리드 검색 (키워드 + 시맨틱)
     """
     try:
+        print(f"🔍 검색 요청 수신: Content-Type={request.content_type}, Method={request.method}")
+        
         data = request.get_json()
+        if data is None:
+            print(f"❌ 요청 본문이 None입니다. Content-Type: {request.content_type}")
+            return jsonify({'success': False, 'message': '요청 본문이 비어있습니다'}), 400
+        
+        print(f"📥 요청 데이터 수신: {data}")
+        
         raw_query = data.get('query', '')
+        top_k = data.get('top_k', 10)
+        
+        print(f"🔍 검색 파라미터: raw_query='{raw_query}', top_k={top_k}")
+        
         if not raw_query or not raw_query.strip():
+            print(f"❌ 검색어가 비어있습니다: raw_query='{raw_query}'")
             return jsonify({'success': False, 'message': '검색어 필요'}), 400
         
         # 검색 쿼리 전처리 (리소스 절약: 검색 시에는 맞춤법 교정 선택적)
@@ -1014,9 +1085,10 @@ def search_embedding():
         if not query:
             query = raw_query.strip()
         
-        top_k = data.get('top_k', 10)
+        print(f"📝 전처리 후 검색어: '{query}' (원본: '{raw_query}')")
         
         if not query:
+            print(f"❌ 전처리 후에도 검색어가 비어있습니다")
             return jsonify({'success': False, 'message': '검색어 필요'}), 400
         
         # FAISS 인덱스 초기화 확인 (한 번만 실행)
@@ -1028,8 +1100,12 @@ def search_embedding():
             print(f"❌ FAISS 인덱스 비어있음: ntotal={faiss_index.ntotal if faiss_index else 0}, id_mapping={len(id_mapping)}")
             return jsonify({'success': True, 'item_ids': [], 'scores': []})
         
+        print(f"✅ FAISS 인덱스 상태: ntotal={faiss_index.ntotal}, id_mapping={len(id_mapping)}")
+        
         # 1. 검색어를 임베딩 벡터로 변환 (BGE-M3 사용, 캐시 활용)
+        print(f"🔄 검색어 임베딩 벡터 변환 시작: query='{query}'")
         query_vector = create_embedding_vector(query, use_cache=True)
+        print(f"✅ 임베딩 벡터 생성 완료: shape={query_vector.shape}")
         
         # 2. FAISS에서 코사인 유사도 기반 Top-K 검색
         k = min(top_k * 3, faiss_index.ntotal)
@@ -1042,12 +1118,16 @@ def search_embedding():
             faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 2)
         
         # 검색 실행
+        print(f"🔍 FAISS 검색 실행: k={k}, ntotal={faiss_index.ntotal}")
         distances, indices = faiss_index.search(np.array([query_vector]), k)
+        print(f"✅ FAISS 검색 완료: distances shape={distances.shape}, indices shape={indices.shape}")
         
         valid_results = len([idx for idx in indices[0] if int(idx) != -1])
         if valid_results == 0:
             print(f"❌ FAISS 검색 결과 없음: k={k}, ntotal={faiss_index.ntotal}, id_mapping={len(id_mapping)}")
             return jsonify({'success': True, 'item_ids': [], 'scores': []})
+        
+        print(f"📊 유효한 검색 결과: {valid_results}개")
         
         # FAISS 인덱스 번호 → MySQL item_id 변환 및 유사도 임계값 필터링
         item_ids = []
@@ -1086,6 +1166,7 @@ def search_embedding():
         item_ids = item_ids[:top_k]
         scores = scores[:top_k]
         
+        print(f"📤 최종 반환 결과 준비: item_ids={len(item_ids)}개, scores={len(scores)}개")
         
         # 안전장치: 모든 scores를 Python float로 강제 변환 (numpy 타입 방지)
         safe_scores = []
@@ -1096,14 +1177,21 @@ def search_embedding():
                 # 변환 실패 시 0.0으로 대체 (안전장치)
                 safe_scores.append(0.0)
         
-        return jsonify({
+        result = {
             'success': True,
             'item_ids': item_ids,
             'scores': safe_scores[:top_k] if safe_scores else []  # 안전하게 변환된 점수만 반환
-        })
+        }
+        
+        print(f"✅ 검색 완료 및 응답 반환: item_ids={len(result['item_ids'])}, scores={len(result['scores'])}")
+        print(f"   상위 5개 item_ids: {result['item_ids'][:5]}")
+        
+        return jsonify(result)
         
     except Exception as e:
         print(f"❌ 검색 실패: {str(e)}")
+        import traceback
+        print(f"   상세 에러:\n{traceback.format_exc()}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/api/v1/embedding/search-by-image', methods=['POST'])
