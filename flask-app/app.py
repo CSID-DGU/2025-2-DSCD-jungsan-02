@@ -244,8 +244,9 @@ def initialize_faiss():
                 faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
                 print(f"   HNSW 파라미터 설정: ef_search={HNSW_EF_SEARCH}")
         else:
-            # 파일이 없거나 손상된 경우 백업 후 삭제
+            # 파일이 없거나 손상된 경우
             if os.path.exists(FAISS_INDEX_PATH) or os.path.exists(FAISS_MAPPING_PATH):
+                # 손상된 파일인 경우 백업 후 삭제
                 print(f"🔄 손상된 파일을 백업하고 새 인덱스를 생성합니다...")
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 
@@ -272,24 +273,33 @@ def initialize_faiss():
                             os.remove(FAISS_MAPPING_PATH)
                         except:
                             pass
-            
-            # 새 인덱스 생성
-            # 인덱스 타입에 따라 선택
-            if FAISS_INDEX_TYPE.upper() == "HNSW":
-                # HNSW 인덱스: 대량 데이터 검색 최적화 (근사 최근접 이웃)
-                # IndexHNSWFlat: 내적 기반 + HNSW 그래프 구조
-                faiss_index = faiss.IndexHNSWFlat(EMBEDDING_DIMENSION, HNSW_M)
-                faiss_index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
-                faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
-                print(f"✅ HNSW FAISS 인덱스 생성 (M={HNSW_M}, ef_construction={HNSW_EF_CONSTRUCTION}, ef_search={HNSW_EF_SEARCH})")
+                
+                # 손상된 파일이 있었으므로 새 인덱스 생성 (메모리상에서만, 저장은 나중에)
+                if FAISS_INDEX_TYPE.upper() == "HNSW":
+                    faiss_index = faiss.IndexHNSWFlat(EMBEDDING_DIMENSION, HNSW_M)
+                    faiss_index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
+                    faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
+                    print(f"✅ HNSW FAISS 인덱스 생성 (M={HNSW_M}, ef_construction={HNSW_EF_CONSTRUCTION}, ef_search={HNSW_EF_SEARCH})")
+                else:
+                    faiss_index = faiss.IndexFlatIP(EMBEDDING_DIMENSION)
+                    print("✅ Flat FAISS 인덱스 생성 (정확한 검색)")
+                
+                id_mapping = {}
             else:
-                # Flat 인덱스: 정확한 검색 (소량 데이터용)
-                faiss_index = faiss.IndexFlatIP(EMBEDDING_DIMENSION)
-                print("✅ Flat FAISS 인덱스 생성 (정확한 검색)")
-            
-            id_mapping = {}
+                # 파일이 없는 경우: CI/CD 시 초기화 방지
+                # 빈 인덱스를 메모리에만 생성 (디스크에 저장하지 않음)
+                # CSV 임포트 API 호출 시 데이터가 추가되면 그때 저장됨
+                print(f"⚠️ FAISS 인덱스 파일이 없습니다. 빈 인덱스로 시작합니다 (CSV 임포트 API 호출 시 데이터 추가됨).")
+                if FAISS_INDEX_TYPE.upper() == "HNSW":
+                    faiss_index = faiss.IndexHNSWFlat(EMBEDDING_DIMENSION, HNSW_M)
+                    faiss_index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
+                    faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
+                else:
+                    faiss_index = faiss.IndexFlatIP(EMBEDDING_DIMENSION)
+                id_mapping = {}
+                print(f"   인덱스 타입: {FAISS_INDEX_TYPE}, 벡터 개수: 0 (CSV 임포트로 데이터 추가 필요)")
     except Exception as e:
-        # 예상치 못한 예외 발생 시에도 새 인덱스 생성
+        # 예상치 못한 예외 발생 시에도 새 인덱스 생성 (메모리상에서만)
         print(f"❌ FAISS 초기화 중 예외 발생: {e}")
         import traceback
         traceback.print_exc()
@@ -304,7 +314,7 @@ def initialize_faiss():
         except:
             pass
         
-        # 새 인덱스 생성
+        # 새 인덱스 생성 (메모리상에서만, 디스크 저장은 나중에)
         if FAISS_INDEX_TYPE.upper() == "HNSW":
             faiss_index = faiss.IndexHNSWFlat(EMBEDDING_DIMENSION, HNSW_M)
             faiss_index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
@@ -312,7 +322,7 @@ def initialize_faiss():
         else:
             faiss_index = faiss.IndexFlatIP(EMBEDDING_DIMENSION)
         id_mapping = {}
-        print(f"✅ 새 FAISS 인덱스 생성 완료 (예외 복구)")
+        print(f"✅ 새 FAISS 인덱스 생성 완료 (예외 복구, 메모리상에서만)")
     finally:
         # 잠금 해제
         if lock_file and lock_acquired:
@@ -616,71 +626,16 @@ def warmup_models():
     except Exception as exc:
         print(f"⚠️ 모델 워밍업 실패: {exc}")
 
-
 models_warmed = False
-
-def check_and_recover_faiss():
-    """FAISS 인덱스가 비어있으면 Spring 서버에 요청하여 복구 시도"""
-    global faiss_index, id_mapping
-    
-    if faiss_index is None or faiss_index.ntotal == 0:
-        print(f"⚠️ FAISS 인덱스가 비어있습니다 (ntotal={faiss_index.ntotal if faiss_index else 0})")
-        print(f"🔄 Spring 서버에 복구 요청을 시도합니다...")
-        
-        # Spring 서버 URL (환경 변수로 설정 가능)
-        spring_server_url = os.getenv("SPRING_SERVER_URL", "http://spring-app:8080")
-        
-        try:
-            # Spring 서버의 동기화 API 호출하여 DB의 모든 item_id 조회
-            # 이 API는 FAISS에 없는 항목들을 재생성하도록 Spring 서버에 요청
-            sync_url = f"{spring_server_url}/api/v1/admin/faiss/recover"
-            
-            print(f"📡 Spring 서버에 복구 요청: {sync_url}")
-            response = requests.post(
-                sync_url,
-                timeout=30,
-                headers={'Content-Type': 'application/json'}
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                print(f"✅ Spring 서버 복구 응답: {result}")
-                # 복구 후 다시 FAISS 로드 시도
-                time.sleep(2)  # 복구 완료 대기
-                initialize_faiss()
-                if faiss_index and faiss_index.ntotal > 0:
-                    print(f"✅ FAISS 복구 완료: {faiss_index.ntotal}개 벡터")
-                else:
-                    print(f"⚠️ FAISS 복구 후에도 여전히 비어있습니다")
-            else:
-                print(f"⚠️ Spring 서버 복구 요청 실패: {response.status_code}, {response.text}")
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️ Spring 서버 연결 실패 (복구 스킵): {e}")
-            print(f"   Spring 서버 URL: {spring_server_url}")
-            print(f"   이는 정상일 수 있습니다 (Spring 서버가 아직 시작되지 않았거나 네트워크 문제)")
-        except Exception as e:
-            print(f"⚠️ FAISS 복구 중 예외 발생: {e}")
-            import traceback
-            traceback.print_exc()
-
 # 각 워커 시작 시 모델과 FAISS 미리 로드
 # 예외가 발생해도 앱이 시작될 수 있도록 try-except 처리
 try:
     initialize_faiss()
-    
-    # FAISS가 비어있으면 복구 시도 (백그라운드 스레드에서 실행)
-    if faiss_index is None or faiss_index.ntotal == 0:
-        print(f"⚠️ FAISS 인덱스가 비어있습니다. 백그라운드에서 복구를 시도합니다...")
-        # 백그라운드 스레드에서 복구 시도 (앱 시작을 블로킹하지 않음)
-        recovery_thread = threading.Thread(target=check_and_recover_faiss, daemon=True)
-        recovery_thread.start()
-        print(f"✅ 복구 스레드 시작됨 (백그라운드 실행)")
-    
 except Exception as e:
     print(f"⚠️ FAISS 초기화 실패 (앱은 계속 시작됩니다): {e}")
     import traceback
     traceback.print_exc()
-    # 빈 인덱스로 시작
+    # 빈 인덱스로 시작 (예외 발생 시)
     if faiss_index is None:
         if FAISS_INDEX_TYPE.upper() == "HNSW":
             faiss_index = faiss.IndexHNSWFlat(EMBEDDING_DIMENSION, HNSW_M)
@@ -690,11 +645,7 @@ except Exception as e:
             faiss_index = faiss.IndexFlatIP(EMBEDDING_DIMENSION)
         id_mapping = {}
         _faiss_initialized = True
-        print(f"✅ 빈 FAISS 인덱스로 시작합니다.")
-        
-        # 빈 인덱스로 시작했으므로 복구 시도
-        recovery_thread = threading.Thread(target=check_and_recover_faiss, daemon=True)
-        recovery_thread.start()
+        print(f"✅ 빈 FAISS 인덱스로 시작합니다 (CSV 임포트 API 호출 시 데이터 추가됨).")
 
 try:
     warmup_models()
@@ -1107,11 +1058,15 @@ def search_embedding():
         query_vector = create_embedding_vector(query, use_cache=True)
         print(f"✅ 임베딩 벡터 생성 완료: shape={query_vector.shape}")
         
-        # 2. FAISS에서 코사인 유사도 기반 Top-K 검색
-        k = min(top_k * 3, faiss_index.ntotal)
+        # 2. FAISS에서 코사인 유사도 기반 검색
+        # top_k는 최대 반환 개수로만 사용 (상한선)
+        # 유사도 임계값 이상인 결과를 최대 top_k개까지 반환
+        k = min(max(top_k * 3, top_k + 50), faiss_index.ntotal)  # 충분히 많이 가져와서 필터링
         if k == 0:
             print(f"❌ k=0: top_k={top_k}, ntotal={faiss_index.ntotal}")
             return jsonify({'success': True, 'item_ids': [], 'scores': []})
+        
+        print(f"📊 검색 파라미터: top_k={top_k} (최대 반환 개수), k={k} (검색 범위), ntotal={faiss_index.ntotal}, 임계값={SIMILARITY_THRESHOLD}")
         
         # HNSW 인덱스인 경우 ef_search 파라미터 설정
         if hasattr(faiss_index, 'hnsw'):
@@ -1130,43 +1085,34 @@ def search_embedding():
         print(f"📊 유효한 검색 결과: {valid_results}개")
         
         # FAISS 인덱스 번호 → MySQL item_id 변환 및 유사도 임계값 필터링
+        # 유사도 임계값 이상인 결과만 동적으로 수집 (top_k는 최대 개수로만 사용)
         item_ids = []
         scores = []
         threshold_passed = 0
+        threshold_failed = 0
         mapping_missing = 0
         
         for idx, dist in zip(indices[0], distances[0]):
+            # top_k를 초과하면 즉시 중단 (최대 개수 제한)
+            if len(item_ids) >= top_k:
+                break
+                
             if int(idx) != -1:
                 if int(idx) in id_mapping:
                     score = float(dist)  # IndexFlatIP이므로 내적 값 (높을수록 유사)
-                    # 유사도 임계값 이상인 결과만 포함
+                    # 유사도 임계값 이상인 결과만 포함 (동적 필터링)
+                    # BGE-M3는 정규화된 임베딩을 사용하므로 내적 값은 대략 0.3~0.95 범위
                     if score >= SIMILARITY_THRESHOLD:
                         threshold_passed += 1
                         item_ids.append(id_mapping[int(idx)])
                         scores.append(score)
+                    else:
+                        threshold_failed += 1
+                        # 임계값 미만인 경우 로그 (디버깅용, 처음 몇 개만)
+                        if threshold_failed <= 5:
+                            print(f"   임계값 미만: item_id={id_mapping[int(idx)]}, score={score:.4f} < {SIMILARITY_THRESHOLD}")
                 else:
                     mapping_missing += 1
-        
-        # 최소 결과 수 보장 (임계값을 만족하는 결과가 적어도 최소 개수는 반환)
-        if len(item_ids) < MIN_RESULTS_TO_RETURN and valid_results > 0:
-            # 임계값 미만이어도 상위 결과를 포함 (최소 개수 보장)
-            item_ids = []
-            scores = []
-            for idx, dist in zip(indices[0], distances[0]):
-                if int(idx) != -1 and int(idx) in id_mapping:
-                    item_ids.append(id_mapping[int(idx)])
-                    scores.append(float(dist))
-                    if len(item_ids) >= top_k:
-                        break
-            print(f"⚠️ 임계값 미만 결과 포함: {len(item_ids)}개 (임계값={SIMILARITY_THRESHOLD}, 유효결과={valid_results}, 매핑없음={mapping_missing})")
-        else:
-            print(f"✅ 검색 완료: {len(item_ids)}개 (임계값 통과={threshold_passed}, 유효결과={valid_results}, 매핑없음={mapping_missing})")
-        
-        # top_k만큼만 반환
-        item_ids = item_ids[:top_k]
-        scores = scores[:top_k]
-        
-        print(f"📤 최종 반환 결과 준비: item_ids={len(item_ids)}개, scores={len(scores)}개")
         
         # 안전장치: 모든 scores를 Python float로 강제 변환 (numpy 타입 방지)
         safe_scores = []
@@ -1179,12 +1125,17 @@ def search_embedding():
         
         result = {
             'success': True,
-            'item_ids': item_ids,
-            'scores': safe_scores[:top_k] if safe_scores else []  # 안전하게 변환된 점수만 반환
+            'item_ids': item_ids,  # 유사도 임계값 이상인 결과만 반환 (최대 top_k개)
+            'scores': safe_scores
         }
         
         print(f"✅ 검색 완료 및 응답 반환: item_ids={len(result['item_ids'])}, scores={len(result['scores'])}")
-        print(f"   상위 5개 item_ids: {result['item_ids'][:5]}")
+        print(f"   임계값 통과: {threshold_passed}개, 임계값 미만: {threshold_failed}개, 매핑 없음: {mapping_missing}개")
+        if result['item_ids']:
+            print(f"   상위 5개 item_ids: {result['item_ids'][:5]}")
+        if result['scores']:
+            print(f"   상위 5개 scores: {[f'{s:.4f}' for s in result['scores'][:5]]}")
+        print(f"   최대 반환 개수(top_k): {top_k}, 실제 반환: {len(result['item_ids'])}개 (유사도 임계값 이상만)")
         
         return jsonify(result)
         
@@ -1228,7 +1179,7 @@ def search_by_image():
             initialize_faiss()
         
         if faiss_index is None or faiss_index.ntotal == 0:
-            return jsonify({'success': True, 'item_ids': []})
+            return jsonify({'success': True, 'item_ids': [], 'scores': []})
         
         # 1. 이미지를 임베딩 벡터로 변환
         #    AI 팀: create_embedding_from_image() 함수 구현 필요
@@ -1239,7 +1190,9 @@ def search_by_image():
             return jsonify({'success': False, 'message': str(err)}), 400
         
         # 2. FAISS에서 유사도 검색
-        k = min(top_k, faiss_index.ntotal)
+        # top_k는 최대 반환 개수로만 사용 (상한선)
+        # 유사도 임계값 이상인 결과를 최대 top_k개까지 반환
+        k = min(max(top_k * 3, top_k + 50), faiss_index.ntotal)  # 충분히 많이 가져와서 필터링
         
         # HNSW 인덱스인 경우 ef_search 파라미터 설정
         if hasattr(faiss_index, 'hnsw'):
@@ -1248,30 +1201,26 @@ def search_by_image():
         distances, indices = faiss_index.search(np.array([query_vector]), k)
         
         # 3. FAISS 인덱스 번호 → MySQL item_id 변환 및 유사도 임계값 필터링
+        # 유사도 임계값 이상인 결과만 동적으로 수집 (top_k는 최대 개수로만 사용)
         item_ids = []
         scores = []
+        threshold_passed = 0
+        threshold_failed = 0
+        
         for idx, dist in zip(indices[0], distances[0]):
+            # top_k를 초과하면 즉시 중단 (최대 개수 제한)
+            if len(item_ids) >= top_k:
+                break
+                
             if int(idx) != -1 and int(idx) in id_mapping:
                 score = float(dist)  # numpy float32를 Python float로 명시적 변환
-                # 유사도 임계값 이상인 결과만 포함
+                # 유사도 임계값 이상인 결과만 포함 (동적 필터링)
                 if score >= SIMILARITY_THRESHOLD:
+                    threshold_passed += 1
                     item_ids.append(id_mapping[int(idx)])
-                    scores.append(float(score))  # 명시적으로 Python float로 변환
-        
-        # 최소 결과 수 보장
-        if len(item_ids) < MIN_RESULTS_TO_RETURN:
-            item_ids = []
-            scores = []
-            for idx, dist in zip(indices[0], distances[0]):
-                if int(idx) != -1 and int(idx) in id_mapping:
-                    item_ids.append(id_mapping[int(idx)])
-                    scores.append(float(dist))  # numpy float32를 Python float로 변환
-                    if len(item_ids) >= MIN_RESULTS_TO_RETURN:
-                        break
-        
-        # top_k만큼만 반환
-        item_ids = item_ids[:top_k]
-        scores = [float(s) for s in scores[:top_k]] if scores else []  # 모든 점수를 Python float로 변환
+                    scores.append(score)
+                else:
+                    threshold_failed += 1
         
         # 안전장치: 모든 scores를 Python float로 강제 변환 (numpy 타입 방지)
         safe_scores = []
@@ -1282,13 +1231,13 @@ def search_by_image():
                 # 변환 실패 시 0.0으로 대체 (안전장치)
                 safe_scores.append(0.0)
         
-        filtered_count = len([s for s in safe_scores if s >= SIMILARITY_THRESHOLD]) if safe_scores else len(item_ids)
-        print(f"🔍 이미지 검색 완료: top_k={top_k}, 결과={len(item_ids)}개, 임계값 이상: {filtered_count}개")
+        print(f"🔍 이미지 검색 완료: 최대 반환 개수(top_k)={top_k}, 실제 반환={len(item_ids)}개")
+        print(f"   임계값 통과: {threshold_passed}개, 임계값 미만: {threshold_failed}개, 임계값={SIMILARITY_THRESHOLD}")
         
         return jsonify({
             'success': True,
-            'item_ids': item_ids,
-            'scores': safe_scores[:top_k] if safe_scores else []  # 안전하게 변환된 점수만 반환
+            'item_ids': item_ids,  # 유사도 임계값 이상인 결과만 반환 (최대 top_k개)
+            'scores': safe_scores
         })
         
     except Exception as e:

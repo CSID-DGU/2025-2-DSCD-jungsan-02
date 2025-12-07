@@ -504,10 +504,23 @@ public class LostItemService {
         // 1. 키워드 검색과 시맨틱 검색을 병렬로 실행 (성능 개선)
         // 시맨틱 검색 topK 최적화: 키워드 매칭 결과를 고려하여 필요한 만큼만 가져옴
         // 키워드 매칭이 있으면 그만큼 덜 가져와도 됨
-        int semanticSearchTopK = Math.min(
-                Math.max(request.topK() * 2, 50),  // 최소 50개, 최대 topK * 2
-                200  // 최대 200개로 제한 (너무 많이 가져오지 않음)
-        );
+        // 실제 필요한 개수만 요청
+        int requestedTopK = request.topK();
+        // 필터가 있으면 더 많이 가져와야 하지만, 없으면 정확히 필요한 만큼만
+        boolean hasFilters = hasFilters(request);
+        int semanticSearchTopK;
+        if (hasFilters) {
+            // 필터가 있으면 필터링 후에도 충분한 결과를 얻기 위해 여유 있게
+            semanticSearchTopK = Math.min(
+                    Math.max(requestedTopK * 2, 20),  // 최소 20개, 최대 topK * 2
+                    100  // 최대 100개로 제한
+            );
+        } else {
+            // 필터가 없으면 정확히 필요한 만큼만 (여유 없이)
+            semanticSearchTopK = requestedTopK;  // 정확히 요청한 만큼만
+        }
+        log.info("시맨틱 검색 topK 설정: requestedTopK={}, semanticSearchTopK={}, hasFilters={}", 
+                requestedTopK, semanticSearchTopK, hasFilters);
         
         // 병렬 실행을 위한 CompletableFuture 사용
         CompletableFuture<List<LostItem>> keywordSearchFuture = 

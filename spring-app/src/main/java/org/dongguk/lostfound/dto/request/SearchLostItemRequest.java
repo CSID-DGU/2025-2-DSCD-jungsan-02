@@ -18,9 +18,9 @@ public record SearchLostItemRequest(
         Integer size
 ) {
     public SearchLostItemRequest {
-        // topK가 null이거나 0 이하면 기본값 500으로 설정 (충분히 많은 결과 반환)
+        // topK가 null이거나 0 이하면 기본값 20으로 설정 (적절한 개수)
         if (topK == null || topK <= 0) {
-            topK = 500;
+            topK = 20;
         }
         // 페이지네이션 기본값 설정
         if (page == null || page < 0) {
