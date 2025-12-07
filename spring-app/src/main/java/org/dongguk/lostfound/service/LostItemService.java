@@ -624,8 +624,7 @@ public class LostItemService {
         combinedItems.addAll(keywordMatchedItems); // 키워드 매칭 결과를 먼저 추가
         combinedItems.addAll(scoredSemanticItems);  // 시맨틱 검색 결과 추가
         
-        // 7. 필터 적용
-        boolean hasFilters = hasFilters(request);
+        // 7. 필터 적용 (hasFilters는 이미 510번 줄에서 선언됨)
         log.info("필터 적용 여부: {}, 필터 조건: category={}, location={}, locations={}, locationRadius={}, brand={}, foundDateAfter={}", 
                 hasFilters, request.category(), request.location(), request.locations(), request.locationRadius(), request.brand(), request.foundDateAfter());
         
