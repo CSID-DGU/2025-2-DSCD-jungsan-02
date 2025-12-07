@@ -689,6 +689,7 @@ def create_embedding():
     """
     try:
         item_id = request.form.get('item_id')
+        item_name = request.form.get('item_name', '')  # 분실물 제목
         raw_description = request.form.get('description', '')
         image_file = request.files.get('image')
         
@@ -715,11 +716,13 @@ def create_embedding():
             else:
                 print(f"🖼️ 이미지 분석 완료: {image_description[:150]}...")
         
-        # 2. 이미지 묘사 + 사용자 설명 결합
+        # 2. 캡션 + 분실물 제목 + 사용자 설명 결합
         #    혁신적 개선: 사용자 입력도 검색 최적화 전처리 적용
         parts = []
         if image_description:
             parts.append(image_description)
+        if item_name and item_name.strip():
+            parts.append(item_name.strip())
         if raw_description and raw_description.strip():
             # 사용자 입력도 검색 최적화 전처리 적용
             processed_description = preprocess_text(
@@ -750,9 +753,14 @@ def create_embedding():
             # 전처리 실패 시 원본 사용 (공백 제거만)
             final_text = raw_full_text.strip()
         
-        print(f"🧾 임베딩 텍스트: item_id={item_id}")
-        print(f"   원본: {raw_full_text[:100]}...")
-        print(f"   전처리 후: {final_text[:100]}...")
+        # 최종 임베딩 텍스트 로그 출력 (FAISS 저장 전)
+        print(f"📝 [임베딩 텍스트] item_id={item_id}")
+        print(f"   캡션: {image_description[:200] if image_description else '(없음)'}")
+        print(f"   제목: {item_name if item_name else '(없음)'}")
+        print(f"   설명: {raw_description[:200] if raw_description else '(없음)'}")
+        print(f"   결합된 원본 텍스트: {raw_full_text}")
+        print(f"   전처리 후 최종 임베딩 텍스트: {final_text}")
+        print(f"   텍스트 길이: 원본={len(raw_full_text)}자, 최종={len(final_text)}자")
         
         # 4. 텍스트를 임베딩 벡터로 변환 (BGE-M3 사용)
         #    검색 시와 동일한 방식으로 임베딩 생성
@@ -844,6 +852,7 @@ def create_embeddings_batch():
         def process_item(item):
             """단일 아이템 처리"""
             item_id = item.get('item_id')
+            item_name = item.get('item_name', '')  # 분실물 제목
             raw_description = item.get('description', '')
             image_url = item.get('image_url', '')
             
@@ -890,10 +899,12 @@ def create_embeddings_batch():
                 if caption_failed and not image_description and raw_description:
                     image_description = raw_description.strip()
                 
-                # 2. 텍스트 결합 및 전처리
+                # 2. 캡션 + 분실물 제목 + 사용자 설명 결합 및 전처리
                 parts = []
                 if image_description:
                     parts.append(image_description)
+                if item_name and item_name.strip():
+                    parts.append(item_name.strip())
                 if raw_description and raw_description.strip():
                     parts.append(raw_description.strip())
                 
@@ -912,6 +923,15 @@ def create_embeddings_batch():
                 )
                 if not final_text or len(final_text.strip()) == 0:
                     final_text = raw_full_text.strip()
+                
+                # 최종 임베딩 텍스트 로그 출력 (FAISS 저장 전)
+                print(f"📝 [배치 임베딩 텍스트] item_id={item_id}")
+                print(f"   캡션: {image_description[:200] if image_description else '(없음)'}")
+                print(f"   제목: {item_name if item_name else '(없음)'}")
+                print(f"   설명: {raw_description[:200] if raw_description else '(없음)'}")
+                print(f"   결합된 원본 텍스트: {raw_full_text}")
+                print(f"   전처리 후 최종 임베딩 텍스트: {final_text}")
+                print(f"   텍스트 길이: 원본={len(raw_full_text)}자, 최종={len(final_text)}자")
                 
                 # 3. 임베딩 벡터 생성 (캐시 활용)
                 embedding_vector = create_embedding_vector(final_text, use_cache=True)
