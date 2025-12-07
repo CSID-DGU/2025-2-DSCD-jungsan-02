@@ -665,23 +665,36 @@ public class LostItemService {
         String pattern = "%" + escapedKeyword + "%";
         
         // 장소 필터링을 위한 좌표 미리 계산 (메모리 필터링 최소화)
-        // 여러 장소가 있으면 첫 번째 장소 사용 (DB 레벨 필터링용)
-        TmapApiService.TmapPlaceResult locationPlaceResult = null;
+        // 여러 장소가 있으면 모든 장소를 변환 (메모리 레벨 필터링용)
+        List<TmapApiService.TmapPlaceResult> locationPlaceResults = new java.util.ArrayList<>();
+        TmapApiService.TmapPlaceResult locationPlaceResult = null; // DB 레벨 필터링용 (첫 번째 장소)
         double radius = locationRadius != null ? locationRadius : 10000.0; // 기본값 10km
         
-        // 여러 장소가 있는 경우 첫 번째 장소 사용
+        // 여러 장소가 있는 경우 모든 장소 변환
         if (request.locations() != null && !request.locations().isEmpty()) {
-            String firstLocation = request.locations().get(0);
-            if (firstLocation != null && !firstLocation.trim().isEmpty()) {
-                locationPlaceResult = tmapApiService.searchPlace(firstLocation.trim());
+            for (String loc : request.locations()) {
+                if (loc != null && !loc.trim().isEmpty()) {
+                    TmapApiService.TmapPlaceResult placeResult = tmapApiService.searchPlace(loc.trim());
+                    if (placeResult != null) {
+                        locationPlaceResults.add(placeResult);
+                        // 첫 번째 장소는 DB 레벨 필터링용으로 사용
+                        if (locationPlaceResult == null) {
+                            locationPlaceResult = placeResult;
+                        }
+                    }
+                }
             }
         } 
         // 단일 장소가 있는 경우
         else if (request.location() != null && !request.location().trim().isEmpty()) {
             locationPlaceResult = tmapApiService.searchPlace(request.location().trim());
+            if (locationPlaceResult != null) {
+                locationPlaceResults.add(locationPlaceResult);
+            }
         }
         
-        final TmapApiService.TmapPlaceResult finalLocationPlaceResult = locationPlaceResult;
+        final TmapApiService.TmapPlaceResult finalLocationPlaceResult = locationPlaceResult; // DB 레벨 필터링용
+        final List<TmapApiService.TmapPlaceResult> finalLocationPlaceResults = locationPlaceResults; // 메모리 레벨 필터링용
         final double finalLocationRadius = radius;
         
         // Specification 생성: 모든 필터를 한 번에 적용
@@ -739,8 +752,8 @@ public class LostItemService {
                                 finalLocationPlaceResult.getLongitude() - radiusInDegrees,
                                 finalLocationPlaceResult.getLongitude() + radiusInDegrees)
                 ));
-            } else if (request.location() != null && !request.location().trim().isEmpty()) {
-                // 좌표 변환 실패 시 문자열 일치 방식으로 폴백
+            } else if (request.location() != null && !request.location().trim().isEmpty() && locationRadius == null) {
+                // 좌표 변환 실패 시 문자열 일치 방식으로 폴백 (거리 필터가 없는 경우에만)
                 String locationKeyword = request.location().toLowerCase().trim();
                 String locationPattern = "%" + locationKeyword
                         .replace("!", "!!")
@@ -748,6 +761,7 @@ public class LostItemService {
                         .replace("_", "!_") + "%";
                 predicates.add(cb.like(cb.lower(root.get("location")), locationPattern, escapeChar));
             }
+            // 거리 필터가 설정된 경우 좌표 변환 실패하면 필터링 실패 (문자열 폴백 없음)
             
             return cb.and(predicates.toArray(new Predicate[0]));
         };
@@ -758,17 +772,27 @@ public class LostItemService {
         List<LostItem> items = itemPage.getContent();
         
         // 좌표 기반 필터링이 있는 경우: 정확한 거리 계산으로 재필터링 (DB에서 대략적으로 필터링된 후)
-        if (finalLocationPlaceResult != null) {
+        // 여러 장소가 있으면 OR 조건 (하나라도 만족하면 통과)
+        if (!finalLocationPlaceResults.isEmpty()) {
             items = items.stream()
                     .filter(item -> {
                         if (item.getLatitude() == null || item.getLongitude() == null) {
-                            return false;
+                            return false; // 좌표가 없으면 필터링 실패
                         }
-                        double distance = calculateHaversineDistance(
-                                finalLocationPlaceResult.getLatitude(), finalLocationPlaceResult.getLongitude(),
-                                item.getLatitude(), item.getLongitude()
-                        );
-                        return distance <= finalLocationRadius;
+                        
+                        // 여러 장소 중 하나라도 반경 내에 있으면 통과
+                        for (TmapApiService.TmapPlaceResult placeResult : finalLocationPlaceResults) {
+                            if (placeResult != null) {
+                                double distance = calculateHaversineDistance(
+                                        placeResult.getLatitude(), placeResult.getLongitude(),
+                                        item.getLatitude(), item.getLongitude()
+                                );
+                                if (distance <= finalLocationRadius) {
+                                    return true; // 하나라도 만족하면 통과
+                                }
+                            }
+                        }
+                        return false; // 모든 장소에서 반경 밖이면 실패
                     })
                     .toList();
         }
@@ -808,12 +832,63 @@ public class LostItemService {
         // 여러 장소가 있는 경우 OR 조건 (하나라도 만족하면 통과)
         boolean locationMatches = false;
         
+        // 장소 필터가 있는지 확인
+        boolean hasLocationFilter = (request.locations() != null && !request.locations().isEmpty()) ||
+                                    (request.location() != null && !request.location().trim().isEmpty());
+        
+        if (!hasLocationFilter) {
+            // 장소 필터가 없으면 통과
+            locationMatches = true;
+        }
         // 여러 장소가 있는 경우
-        if (locationPlaceResults != null && !locationPlaceResults.isEmpty()) {
+        else if (locationPlaceResults != null && !locationPlaceResults.isEmpty()) {
             double radius = locationRadius != null ? locationRadius : 10000.0; // 기본값 10km
             
+            // 아이템 좌표가 없으면 필터링 실패 (거리 필터가 설정된 경우)
             if (item.getLatitude() == null || item.getLongitude() == null) {
-                return false; // 좌표가 없으면 장소 필터링 실패
+                // 거리 필터가 설정되어 있으면 좌표가 없으면 실패
+                if (locationRadius != null) {
+                    log.debug("장소 필터 실패: itemId={}, itemLocation={}, 좌표 없음 (거리 필터 설정됨)", 
+                            item.getId(), item.getLocation());
+                    return false;
+                }
+                // 거리 필터가 없으면 문자열 일치로 폴백
+                List<String> locationsToCheck = request.locations() != null && !request.locations().isEmpty() 
+                    ? request.locations() 
+                    : (request.location() != null && !request.location().trim().isEmpty() 
+                        ? List.of(request.location()) 
+                        : List.of());
+                
+                for (String loc : locationsToCheck) {
+                    if (loc != null && !loc.trim().isEmpty() && item.getLocation() != null) {
+                        String locationKeyword = loc.toLowerCase().trim();
+                        String itemLocation = item.getLocation().toLowerCase();
+                        
+                        // 키워드가 '역', '구', '동' 등으로 끝나는 경우 이를 제거하고 더 넓게 검색
+                        String locationKeywordWithoutSuffix = locationKeyword;
+                        if (locationKeyword.endsWith("역")) {
+                            locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                        } else if (locationKeyword.endsWith("구")) {
+                            locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                        } else if (locationKeyword.endsWith("동")) {
+                            locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                        }
+                        
+                        boolean matches = itemLocation.contains(locationKeyword);
+                        if (!matches && !locationKeywordWithoutSuffix.equals(locationKeyword) && locationKeywordWithoutSuffix.length() > 0) {
+                            matches = itemLocation.contains(locationKeywordWithoutSuffix);
+                        }
+                        if (matches) {
+                            log.debug("장소 필터 통과 (문자열 일치): itemId={}, itemLocation={}, 검색어={}", 
+                                    item.getId(), item.getLocation(), loc);
+                            return true; // 문자열 일치로 통과
+                        }
+                    }
+                }
+                // 문자열 일치도 실패하면 필터링 실패
+                log.debug("장소 필터 실패: itemId={}, itemLocation={}, 좌표 없음, 문자열 일치 실패", 
+                        item.getId(), item.getLocation());
+                return false;
             }
             
             // 여러 장소 중 하나라도 반경 내에 있으면 통과
@@ -823,16 +898,28 @@ public class LostItemService {
                             placeResult.getLatitude(), placeResult.getLongitude(),
                             item.getLatitude(), item.getLongitude()
                     );
+                    log.debug("거리 계산: 장소=({}, {}), 아이템=({}, {}), 거리={}m, 반경={}m, 통과={}", 
+                            placeResult.getLatitude(), placeResult.getLongitude(),
+                            item.getLatitude(), item.getLongitude(),
+                            distance, radius, distance <= radius);
                     if (distance <= radius) {
                         locationMatches = true;
+                        log.debug("장소 필터 통과: itemId={}, itemLocation={}, 장소 좌표=({}, {}), 거리={}m", 
+                                item.getId(), item.getLocation(), 
+                                placeResult.getLatitude(), placeResult.getLongitude(), distance);
                         break; // 하나라도 만족하면 통과
                     }
                 }
             }
             
-            // 좌표 기반 필터링이 실패했지만, 문자열 일치로 폴백 시도
             if (!locationMatches) {
-                // request.locations() 또는 request.location()에서 문자열 일치 확인
+                log.debug("장소 필터 실패: itemId={}, itemLocation={}, 좌표=({}, {}), 모든 장소에서 반경 밖", 
+                        item.getId(), item.getLocation(), item.getLatitude(), item.getLongitude());
+            }
+            
+            // 좌표 기반 필터링이 실패했을 때, 거리 필터가 설정되지 않은 경우에만 문자열 일치로 폴백
+            if (!locationMatches && locationRadius == null) {
+                // 거리 필터가 없으면 문자열 일치로 폴백
                 List<String> locationsToCheck = request.locations() != null && !request.locations().isEmpty() 
                     ? request.locations() 
                     : (request.location() != null && !request.location().trim().isEmpty() 
@@ -860,10 +947,60 @@ public class LostItemService {
                         }
                         if (matches) {
                             locationMatches = true;
+                            log.debug("장소 필터 통과 (문자열 일치 폴백): itemId={}, itemLocation={}, 검색어={}", 
+                                    item.getId(), item.getLocation(), loc);
                             break;
                         }
                     }
                 }
+            }
+        }
+        // 좌표 변환이 실패한 경우 (locationPlaceResults가 비어있음)
+        else if (hasLocationFilter) {
+            // 거리 필터가 설정되어 있으면 좌표 변환 실패 시 필터링 실패
+            if (locationRadius != null) {
+                log.warn("장소 필터 실패: 좌표 변환 실패 (거리 필터 설정됨), itemId={}, itemLocation={}", 
+                        item.getId(), item.getLocation());
+                return false;
+            }
+            // 거리 필터가 없으면 문자열 일치로 폴백
+            List<String> locationsToCheck = request.locations() != null && !request.locations().isEmpty() 
+                ? request.locations() 
+                : (request.location() != null && !request.location().trim().isEmpty() 
+                    ? List.of(request.location()) 
+                    : List.of());
+            
+            for (String loc : locationsToCheck) {
+                if (loc != null && !loc.trim().isEmpty() && item.getLocation() != null) {
+                    String locationKeyword = loc.toLowerCase().trim();
+                    String itemLocation = item.getLocation().toLowerCase();
+                    
+                    // 키워드가 '역', '구', '동' 등으로 끝나는 경우 이를 제거하고 더 넓게 검색
+                    String locationKeywordWithoutSuffix = locationKeyword;
+                    if (locationKeyword.endsWith("역")) {
+                        locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                    } else if (locationKeyword.endsWith("구")) {
+                        locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                    } else if (locationKeyword.endsWith("동")) {
+                        locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                    }
+                    
+                    boolean matches = itemLocation.contains(locationKeyword);
+                    if (!matches && !locationKeywordWithoutSuffix.equals(locationKeyword) && locationKeywordWithoutSuffix.length() > 0) {
+                        matches = itemLocation.contains(locationKeywordWithoutSuffix);
+                    }
+                    if (matches) {
+                        locationMatches = true;
+                        log.debug("장소 필터 통과 (문자열 일치, 좌표 변환 실패): itemId={}, itemLocation={}, 검색어={}", 
+                                item.getId(), item.getLocation(), loc);
+                        break;
+                    }
+                }
+            }
+            
+            if (!locationMatches) {
+                log.debug("장소 필터 실패: 좌표 변환 실패, 문자열 일치도 실패, itemId={}, itemLocation={}", 
+                        item.getId(), item.getLocation());
             }
         }
         // 단일 장소가 있는 경우 (하위 호환성)
@@ -882,18 +1019,65 @@ public class LostItemService {
             if (placeResult != null) {
                 // 좌표 기반 반경 필터링
                 if (item.getLatitude() == null || item.getLongitude() == null) {
-                    return false;
-                }
-                double distance = calculateHaversineDistance(
-                        placeResult.getLatitude(), placeResult.getLongitude(),
-                        item.getLatitude(), item.getLongitude()
-                );
-                double radius = locationRadius != null ? locationRadius : 10000.0; // 기본값 10km
-                if (distance <= radius) {
-                    locationMatches = true;
+                    // 좌표가 없으면 거리 필터가 설정된 경우 실패, 없으면 문자열 일치로 폴백
+                    if (locationRadius != null) {
+                        return false; // 거리 필터가 설정된 경우 좌표가 없으면 실패
+                    }
+                    // 거리 필터가 없으면 문자열 일치로 폴백
+                    String locationKeyword = request.location().toLowerCase().trim();
+                    if (item.getLocation() != null) {
+                        String itemLocation = item.getLocation().toLowerCase();
+                        String locationKeywordWithoutSuffix = locationKeyword;
+                        if (locationKeyword.endsWith("역")) {
+                            locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                        } else if (locationKeyword.endsWith("구")) {
+                            locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                        } else if (locationKeyword.endsWith("동")) {
+                            locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                        }
+                        boolean matches = itemLocation.contains(locationKeyword);
+                        if (!matches && !locationKeywordWithoutSuffix.equals(locationKeyword) && locationKeywordWithoutSuffix.length() > 0) {
+                            matches = itemLocation.contains(locationKeywordWithoutSuffix);
+                        }
+                        locationMatches = matches;
+                    } else {
+                        return false;
+                    }
+                } else {
+                    double distance = calculateHaversineDistance(
+                            placeResult.getLatitude(), placeResult.getLongitude(),
+                            item.getLatitude(), item.getLongitude()
+                    );
+                    double radius = locationRadius != null ? locationRadius : 10000.0; // 기본값 10km
+                    if (distance <= radius) {
+                        locationMatches = true;
+                    } else if (locationRadius == null) {
+                        // 거리 필터가 없으면 문자열 일치로 폴백
+                        String locationKeyword = request.location().toLowerCase().trim();
+                        if (item.getLocation() != null) {
+                            String itemLocation = item.getLocation().toLowerCase();
+                            String locationKeywordWithoutSuffix = locationKeyword;
+                            if (locationKeyword.endsWith("역")) {
+                                locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                            } else if (locationKeyword.endsWith("구")) {
+                                locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                            } else if (locationKeyword.endsWith("동")) {
+                                locationKeywordWithoutSuffix = locationKeyword.substring(0, locationKeyword.length() - 1);
+                            }
+                            boolean matches = itemLocation.contains(locationKeyword);
+                            if (!matches && !locationKeywordWithoutSuffix.equals(locationKeyword) && locationKeywordWithoutSuffix.length() > 0) {
+                                matches = itemLocation.contains(locationKeywordWithoutSuffix);
+                            }
+                            locationMatches = matches;
+                        }
+                    }
                 }
             } else {
-                // 좌표 변환 실패 시 문자열 일치 방식으로 폴백
+                // 좌표 변환 실패 시: 거리 필터가 설정된 경우 실패, 없으면 문자열 일치로 폴백
+                if (locationRadius != null) {
+                    return false; // 거리 필터가 설정된 경우 좌표 변환 실패하면 실패
+                }
+                // 거리 필터가 없으면 문자열 일치 방식으로 폴백
                 String locationKeyword = request.location().toLowerCase().trim();
                 
                 // 키워드가 '역', '구', '동' 등으로 끝나는 경우 이를 제거하고 더 넓게 검색
@@ -914,6 +1098,8 @@ public class LostItemService {
                         matches = itemLocation.contains(locationKeywordWithoutSuffix);
                     }
                     locationMatches = matches;
+                } else {
+                    return false;
                 }
             }
         } else {
