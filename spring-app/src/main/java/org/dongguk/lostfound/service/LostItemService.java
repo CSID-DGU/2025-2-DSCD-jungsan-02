@@ -540,12 +540,47 @@ public class LostItemService {
                 CompletableFuture.supplyAsync(() -> {
                     try {
                         log.info("🔍 시맨틱 검색 시작: query='{}', topK={}", searchQuery, semanticSearchTopK);
-                        FlaskApiService.SearchResult result = flaskApiService.searchSimilarItemsWithScores(searchQuery, semanticSearchTopK);
-                        log.info("✅ 시맨틱 검색 완료: {}개 결과 (query: '{}')", result.getItemIds().size(), searchQuery);
-                        if (result.getItemIds().isEmpty()) {
-                            log.warn("⚠️ 시맨틱 검색 결과가 비어있습니다. query: '{}', topK: {}", searchQuery, semanticSearchTopK);
+                        
+                        // 1단계: 넓게 후보 회수 (메타데이터 없이)
+                        int recallK = Math.min(semanticSearchTopK * 5, 500); // 넓게 후보 수집
+                        FlaskApiService.SearchResult recallResult = flaskApiService.searchSimilarItemsWithScores(searchQuery, recallK);
+                        List<Long> candidateIds = recallResult.getItemIds();
+                        
+                        if (candidateIds.isEmpty()) {
+                            log.warn("⚠️ 후보 회수 결과가 비어있습니다. query: '{}'", searchQuery);
+                            return new FlaskApiService.SearchResult(List.of(), List.of());
                         }
-                        return result;
+                        
+                        log.info("후보 회수 완료: {}개 후보", candidateIds.size());
+                        
+                        // 2단계: 후보들의 메타데이터 조회
+                        Map<Long, FlaskApiService.ItemMetadata> metadataMap = new java.util.HashMap<>();
+                        int batchSize = 500;
+                        for (int i = 0; i < candidateIds.size(); i += batchSize) {
+                            int end = Math.min(i + batchSize, candidateIds.size());
+                            List<Long> batchIds = candidateIds.subList(i, end);
+                            List<LostItem> batchItems = lostItemRepository.findAllById(batchIds);
+                            for (LostItem item : batchItems) {
+                                metadataMap.put(item.getId(), new FlaskApiService.ItemMetadata(
+                                    item.getCategory().name(),
+                                    item.getDescription(),
+                                    item.getItemName(),
+                                    item.getBrand() != null ? item.getBrand() : ""
+                                ));
+                            }
+                        }
+                        
+                        log.info("메타데이터 조회 완료: {}개 항목", metadataMap.size());
+                        
+                        // 3단계: 메타데이터와 함께 게이팅 및 재정렬 수행
+                        FlaskApiService.SearchResult finalResult = flaskApiService.searchSimilarItemsWithScores(
+                            searchQuery, semanticSearchTopK, metadataMap);
+                        
+                        log.info("✅ 시맨틱 검색 완료: {}개 결과 (query: '{}')", finalResult.getItemIds().size(), searchQuery);
+                        if (finalResult.getItemIds().isEmpty()) {
+                            log.warn("⚠️ 최종 검색 결과가 비어있습니다. query: '{}', topK: {}", searchQuery, semanticSearchTopK);
+                        }
+                        return finalResult;
                     } catch (Exception e) {
                         log.error("❌ 시맨틱 검색 실패: query='{}', 에러: {}", searchQuery, e.getMessage(), e);
                         e.printStackTrace();

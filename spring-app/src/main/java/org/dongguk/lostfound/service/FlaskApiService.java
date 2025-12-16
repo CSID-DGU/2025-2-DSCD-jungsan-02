@@ -74,6 +74,11 @@ public class FlaskApiService {
     /**
      * Flask AI 서버에 검색 요청 (item_id 리스트와 점수 반환)
      */
+    /**
+     * 항목 메타데이터 (Flask 게이팅용)
+     */
+    public record ItemMetadata(String category, String description, String itemName, String brand) {}
+    
     public static class SearchResult {
         private final List<Long> itemIds;
         private final List<Double> scores;
@@ -102,17 +107,47 @@ public class FlaskApiService {
     
     /**
      * Flask AI 서버에 검색 요청 (item_id 리스트와 점수 반환)
+     * 새로운 다단계 검색 파이프라인 사용 (메타데이터 기반 게이팅)
      */
     public SearchResult searchSimilarItemsWithScores(String query, Integer topK) {
-        log.info("🔍 Flask AI 서버 검색 요청 시작: query='{}', topK={}", query, topK);
+        return searchSimilarItemsWithScores(query, topK, null);
+    }
+    
+    /**
+     * Flask AI 서버에 검색 요청 (메타데이터 포함)
+     * 메타데이터가 제공되면 게이팅 단계가 작동하여 카테고리/속성 불일치 제거
+     */
+    public SearchResult searchSimilarItemsWithScores(String query, Integer topK, 
+                                                      Map<Long, ItemMetadata> itemMetadata) {
+        log.info("🔍 Flask AI 서버 검색 요청 시작: query='{}', topK={}, metadata={}개 항목", 
+                query, topK, itemMetadata != null ? itemMetadata.size() : 0);
         
         try {
-            Map<String, Object> request = Map.of(
-                    "query", query != null ? query : "",
-                    "top_k", topK != null ? topK : 10
-            );
+            Map<String, Object> request = new java.util.HashMap<>();
+            request.put("query", query != null ? query : "");
+            request.put("top_k", topK != null ? topK : 10);
             
-            log.debug("Flask 요청 데이터: {}", request);
+            // 메타데이터 변환 및 추가
+            if (itemMetadata != null && !itemMetadata.isEmpty()) {
+                Map<String, Object> metadataMap = new java.util.HashMap<>();
+                for (Map.Entry<Long, ItemMetadata> entry : itemMetadata.entrySet()) {
+                    Long itemId = entry.getKey();
+                    ItemMetadata metadata = entry.getValue();
+                    Map<String, Object> itemMeta = new java.util.HashMap<>();
+                    itemMeta.put("category", metadata.category());
+                    itemMeta.put("description", metadata.description() != null ? metadata.description() : "");
+                    itemMeta.put("item_name", metadata.itemName() != null ? metadata.itemName() : "");
+                    itemMeta.put("brand", metadata.brand() != null ? metadata.brand() : "");
+                    metadataMap.put(itemId.toString(), itemMeta);
+                }
+                request.put("item_metadata", metadataMap);
+                log.debug("메타데이터 {}개 항목을 Flask에 전달", metadataMap.size());
+            }
+            
+            log.debug("Flask 요청 데이터: query={}, top_k={}, metadata={}개", 
+                    request.get("query"), request.get("top_k"), 
+                    request.containsKey("item_metadata") ? 
+                        ((Map<?, ?>) request.get("item_metadata")).size() : 0);
 
             Map<String, Object> response = flaskRestClient.post()
                     .uri("/api/v1/embedding/search")

@@ -213,6 +213,7 @@ public class CsvDataImportService {
                         continue;
                     }
                     
+                    String colorNm = parts.length > 1 ? parts[1].trim() : ""; // COLOR_NM (색상 정보)
                     String custodyPlace = parts[2].trim(); // CUSTODY_PLC
                     String imageUrl = parts[3].trim(); // ACQUSTN_THNG_PHOTO_URL
                     String itemName = parts[4].trim(); // THNG_DTLS
@@ -220,8 +221,18 @@ public class CsvDataImportService {
                     String foundDateStr = parts[6].trim(); // ACQUSTN_DE
                     String categoryStr = parts[8].trim(); // THNG_CLASS_LARGE
                     
+                    // 색상 정보를 description에 포함 (게이팅을 위해 필수)
+                    // CSV의 COLOR_NM 필드가 있으면 description 앞에 추가
+                    String enrichedDescription = description;
+                    if (!colorNm.isEmpty()) {
+                        // 색상 정보가 description에 없으면 추가
+                        if (!description.toLowerCase().contains(colorNm.toLowerCase())) {
+                            enrichedDescription = colorNm + " " + description;
+                        }
+                    }
+                    
                     // 필수 필드 검증
-                    if (custodyPlace.isEmpty() || itemName.isEmpty() || description.isEmpty() || 
+                    if (custodyPlace.isEmpty() || itemName.isEmpty() || enrichedDescription.isEmpty() || 
                         foundDateStr.isEmpty() || categoryStr.isEmpty()) {
                         if (processedLines <= 10) { // 처음 10개만 로그 출력
                             log.warn("필수 필드 누락으로 스킵 (라인 {}): custodyPlace={}, itemName={}, description={}, foundDate={}, category={}", 
@@ -287,11 +298,11 @@ public class CsvDataImportService {
                     Double latitude = custodyLocation != null ? custodyLocation.getLatitude() : null;
                     Double longitude = custodyLocation != null ? custodyLocation.getLongitude() : null;
                     
-                    // LostItem 생성
+                    // LostItem 생성 (enrichedDescription 사용)
                     LostItem lostItem = LostItem.create(
                         itemName,
                         category,
-                        description,
+                        enrichedDescription, // 색상 정보가 포함된 description
                         foundDate,
                         custodyPlace, // location
                         latitude,

@@ -22,6 +22,9 @@ import os
 
 from services.captioning import generate_caption
 from services.text_processing import preprocess_text, expand_search_query
+from services.query_understanding import understand_query, QueryAttributes
+from services.gating import gate_candidates
+from services.reranking import rerank_items
 
 app = Flask(__name__)
 CORS(app)
@@ -1008,25 +1011,32 @@ def create_embeddings_batch():
 @app.route('/api/v1/embedding/search', methods=['POST'])
 def search_embedding():
     """
-    자연어 검색: 텍스트 쿼리로 유사한 분실물 검색
+    자연어 검색: 텍스트 쿼리로 유사한 분실물 검색 (다단계 검색 파이프라인)
     
-    프로세스:
-    1. 사용자의 검색어를 BGE-M3로 임베딩 벡터로 변환
-    2. FAISS에서 코사인 유사도 기반 Top-K 검색
-    3. 유사도가 높은 순서대로 MySQL item_id 리스트 반환
+    새로운 검색 아키텍처:
+    1. 쿼리 이해: 구조화된 속성 추출 (카테고리, 색상, 패턴 등)
+    2. 후보 회수: FAISS 임베딩 검색으로 넓게 후보 수집
+    3. 게이팅: 구조적 속성 비교로 필터링 (카테고리/속성 불일치 제거)
+    4. 재정렬: 다중 신호 기반 최종 스코어링
     
     Spring에서 받는 것:
     - query: 자연어 검색어 (필수)
       예) "지하철에서 잃어버린 검은 지갑", "강남역에서 발견한 아이폰"
     - top_k: 반환할 개수 (선택, 기본 10)
+    - item_metadata: 항목 메타데이터 딕셔너리 (선택적, 게이팅 성능 향상)
+      {
+          item_id: {
+              'category': 'WALLET',
+              'description': '...',
+              'item_name': '...'
+          },
+          ...
+      }
     
     Spring으로 보내는 것:
     - success: 성공 여부
-    - item_ids: 유사도 높은 순서대로 정렬된 MySQL item_id 리스트
-    
-    TODO: AI 팀 추가 구현 사항
-    - 날짜/장소 필터링 가중치 적용
-    - 하이브리드 검색 (키워드 + 시맨틱)
+    - item_ids: 최종 정렬된 MySQL item_id 리스트
+    - scores: 최종 점수 리스트
     """
     try:
         print(f"🔍 검색 요청 수신: Content-Type={request.content_type}, Method={request.method}")
@@ -1040,124 +1050,131 @@ def search_embedding():
         
         raw_query = data.get('query', '')
         top_k = data.get('top_k', 10)
+        item_metadata = data.get('item_metadata', {})  # 선택적 메타데이터
         
-        print(f"🔍 검색 파라미터: raw_query='{raw_query}', top_k={top_k}")
+        print(f"🔍 검색 파라미터: raw_query='{raw_query}', top_k={top_k}, 메타데이터={len(item_metadata)}개 항목")
         
         if not raw_query or not raw_query.strip():
             print(f"❌ 검색어가 비어있습니다: raw_query='{raw_query}'")
             return jsonify({'success': False, 'message': '검색어 필요'}), 400
         
-        # 검색 쿼리 전처리 (리소스 절약: 검색 시에는 맞춤법 교정 선택적)
+        # ========== [1단계] 쿼리 이해 ==========
+        print(f"📝 [1단계] 쿼리 이해 시작: '{raw_query}'")
+        query_attrs = understand_query(raw_query)
+        print(f"   추출된 속성: attributes={query_attrs.attributes} (category는 임베딩으로 처리)")
+        
+        # 검색 쿼리 전처리 (임베딩용)
         query = preprocess_text(
             raw_query,
-            use_typo_correction=False,  # 검색 시에는 맞춤법 교정 스킵하여 리소스 절약
-            optimize_for_search=True    # 검색 최적화 적용
+            use_typo_correction=False,
+            optimize_for_search=True
         )
         if not query:
             query = raw_query.strip()
         
-        print(f"📝 전처리 후 검색어: '{query}' (원본: '{raw_query}')")
-        
-        if not query:
-            print(f"❌ 전처리 후에도 검색어가 비어있습니다")
-            return jsonify({'success': False, 'message': '검색어 필요'}), 400
-        
-        # FAISS 인덱스 초기화 확인 (한 번만 실행)
+        # FAISS 인덱스 초기화 확인
         if not _faiss_initialized:
             initialize_faiss()
         
-        # FAISS 인덱스가 비어있으면 빈 결과 반환
         if faiss_index is None or faiss_index.ntotal == 0:
-            print(f"❌ FAISS 인덱스 비어있음: ntotal={faiss_index.ntotal if faiss_index else 0}, id_mapping={len(id_mapping)}")
+            print(f"❌ FAISS 인덱스 비어있음")
             return jsonify({'success': True, 'item_ids': [], 'scores': []})
         
-        print(f"✅ FAISS 인덱스 상태: ntotal={faiss_index.ntotal}, id_mapping={len(id_mapping)}")
-        
-        # 1. 검색어를 임베딩 벡터로 변환 (BGE-M3 사용, 캐시 활용)
-        print(f"🔄 검색어 임베딩 벡터 변환 시작: query='{query}'")
+        # ========== [2단계] 후보 회수 (Recall) ==========
+        print(f"🔍 [2단계] 후보 회수 시작")
         query_vector = create_embedding_vector(query, use_cache=True)
-        print(f"✅ 임베딩 벡터 생성 완료: shape={query_vector.shape}")
         
-        # 2. FAISS에서 코사인 유사도 기반 검색
-        # top_k는 최대 반환 개수로만 사용 (상한선)
-        # 유사도 임계값 이상인 결과를 최대 top_k개까지 반환
-        k = min(max(top_k * 3, top_k + 50), faiss_index.ntotal)  # 충분히 많이 가져와서 필터링
-        if k == 0:
-            print(f"❌ k=0: top_k={top_k}, ntotal={faiss_index.ntotal}")
+        # 넓게 후보 수집 (recall 중심)
+        recall_k = min(max(top_k * 5, top_k + 100), faiss_index.ntotal)
+        if recall_k == 0:
             return jsonify({'success': True, 'item_ids': [], 'scores': []})
         
-        print(f"📊 검색 파라미터: top_k={top_k} (최대 반환 개수), k={k} (검색 범위), ntotal={faiss_index.ntotal}, 임계값={SIMILARITY_THRESHOLD}")
-        
-        # HNSW 인덱스인 경우 ef_search 파라미터 설정
         if hasattr(faiss_index, 'hnsw'):
-            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, k * 2)
+            faiss_index.hnsw.efSearch = max(HNSW_EF_SEARCH, recall_k * 2)
         
-        # 검색 실행
-        print(f"🔍 FAISS 검색 실행: k={k}, ntotal={faiss_index.ntotal}")
-        distances, indices = faiss_index.search(np.array([query_vector]), k)
-        print(f"✅ FAISS 검색 완료: distances shape={distances.shape}, indices shape={indices.shape}")
+        distances, indices = faiss_index.search(np.array([query_vector]), recall_k)
         
-        valid_results = len([idx for idx in indices[0] if int(idx) != -1])
-        if valid_results == 0:
-            print(f"❌ FAISS 검색 결과 없음: k={k}, ntotal={faiss_index.ntotal}, id_mapping={len(id_mapping)}")
-            return jsonify({'success': True, 'item_ids': [], 'scores': []})
-        
-        print(f"📊 유효한 검색 결과: {valid_results}개")
-        
-        # FAISS 인덱스 번호 → MySQL item_id 변환 및 유사도 임계값 필터링
-        # 유사도 임계값 이상인 결과만 동적으로 수집 (top_k는 최대 개수로만 사용)
-        item_ids = []
-        scores = []
-        threshold_passed = 0
-        threshold_failed = 0
-        mapping_missing = 0
+        # FAISS 인덱스 → item_id 변환 및 유사도 임계값 필터링 (초기 필터링)
+        candidate_item_ids = []
+        semantic_scores = {}  # {item_id: similarity_score}
         
         for idx, dist in zip(indices[0], distances[0]):
-            # top_k를 초과하면 즉시 중단 (최대 개수 제한)
-            if len(item_ids) >= top_k:
-                break
+            if int(idx) != -1 and int(idx) in id_mapping:
+                item_id = id_mapping[int(idx)]
+                score = float(dist)
                 
-            if int(idx) != -1:
-                if int(idx) in id_mapping:
-                    score = float(dist)  # IndexFlatIP이므로 내적 값 (높을수록 유사)
-                    # 유사도 임계값 이상인 결과만 포함 (동적 필터링)
-                    # BGE-M3는 정규화된 임베딩을 사용하므로 내적 값은 대략 0.3~0.95 범위
-                    if score >= SIMILARITY_THRESHOLD:
-                        threshold_passed += 1
-                        item_ids.append(id_mapping[int(idx)])
-                        scores.append(score)
-                    else:
-                        threshold_failed += 1
-                        # 임계값 미만인 경우 로그 (디버깅용, 처음 몇 개만)
-                        if threshold_failed <= 5:
-                            print(f"   임계값 미만: item_id={id_mapping[int(idx)]}, score={score:.4f} < {SIMILARITY_THRESHOLD}")
-                else:
-                    mapping_missing += 1
+                # 기본 유사도 임계값 필터링
+                if score >= SIMILARITY_THRESHOLD:
+                    candidate_item_ids.append(item_id)
+                    semantic_scores[item_id] = score
         
-        # 안전장치: 모든 scores를 Python float로 강제 변환 (numpy 타입 방지)
-        safe_scores = []
-        for s in scores:
-            try:
-                safe_scores.append(float(s))  # numpy float32, float64 등 모든 숫자 타입을 Python float로 변환
-            except (TypeError, ValueError):
-                # 변환 실패 시 0.0으로 대체 (안전장치)
-                safe_scores.append(0.0)
+        print(f"   후보 회수 완료: {len(candidate_item_ids)}개 (recall_k={recall_k})")
         
-        result = {
+        if not candidate_item_ids:
+            return jsonify({'success': True, 'item_ids': [], 'scores': []})
+        
+        # ========== [3단계] 게이팅/필터링 ==========
+        # 메타데이터가 제공된 경우에만 게이팅 수행
+        if item_metadata:
+            print(f"🚪 [3단계] 게이팅 시작: {len(candidate_item_ids)}개 후보")
+            # 메타데이터 키를 int로 변환 (Spring에서 문자열로 전달됨)
+            item_metadata_int = {}
+            for key, value in item_metadata.items():
+                try:
+                    item_id_int = int(key)
+                    item_metadata_int[item_id_int] = value
+                except (ValueError, TypeError):
+                    continue
+            
+            passed_item_ids, gating_results = gate_candidates(
+                candidate_item_ids,
+                query_attrs,
+                item_metadata_int
+            )
+            print(f"   게이팅 완료: {len(passed_item_ids)}/{len(candidate_item_ids)}개 통과")
+            
+            # 게이팅 결과 로깅 (상위 5개)
+            for item_id in passed_item_ids[:5]:
+                if item_id in gating_results:
+                    result = gating_results[item_id]
+                    print(f"     item_id={item_id}: penalty={result.penalty_score:.2f}, bonus={result.attribute_bonus:.2f}")
+        else:
+            # 메타데이터가 없으면 모든 후보 통과 (fallback)
+            print(f"⚠️ [3단계] 게이팅 스킵: 메타데이터 없음 (fallback 모드)")
+            passed_item_ids = candidate_item_ids
+            gating_results = {}
+        
+        if not passed_item_ids:
+            return jsonify({'success': True, 'item_ids': [], 'scores': []})
+        
+        # ========== [4단계] 재정렬 ==========
+        print(f"📊 [4단계] 재정렬 시작: {len(passed_item_ids)}개 후보")
+        # 재정렬에도 변환된 메타데이터 사용
+        metadata_for_reranking = item_metadata_int if item_metadata else {}
+        reranking_results = rerank_items(
+            passed_item_ids,
+            query_attrs,
+            semantic_scores,
+            metadata_for_reranking,
+            gating_results if item_metadata else None
+        )
+        
+        # 상위 top_k개 선택
+        final_results = reranking_results[:top_k]
+        final_item_ids = [r.item_id for r in final_results]
+        final_scores = [r.final_score for r in final_results]
+        
+        print(f"   재정렬 완료: 최종 {len(final_item_ids)}개 반환")
+        if final_results:
+            top_result = final_results[0]
+            print(f"   상위 1개: item_id={top_result.item_id}, score={top_result.final_score:.4f}")
+            print(f"     (semantic={top_result.semantic_similarity:.4f}, attr={top_result.attribute_match_score:.4f}, keyword={top_result.keyword_overlap:.4f})")
+        
+        return jsonify({
             'success': True,
-            'item_ids': item_ids,  # 유사도 임계값 이상인 결과만 반환 (최대 top_k개)
-            'scores': safe_scores
-        }
-        
-        print(f"✅ 검색 완료 및 응답 반환: item_ids={len(result['item_ids'])}, scores={len(result['scores'])}")
-        print(f"   임계값 통과: {threshold_passed}개, 임계값 미만: {threshold_failed}개, 매핑 없음: {mapping_missing}개")
-        if result['item_ids']:
-            print(f"   상위 5개 item_ids: {result['item_ids'][:5]}")
-        if result['scores']:
-            print(f"   상위 5개 scores: {[f'{s:.4f}' for s in result['scores'][:5]]}")
-        print(f"   최대 반환 개수(top_k): {top_k}, 실제 반환: {len(result['item_ids'])}개 (유사도 임계값 이상만)")
-        
-        return jsonify(result)
+            'item_ids': final_item_ids,
+            'scores': final_scores
+        })
         
     except Exception as e:
         print(f"❌ 검색 실패: {str(e)}")
