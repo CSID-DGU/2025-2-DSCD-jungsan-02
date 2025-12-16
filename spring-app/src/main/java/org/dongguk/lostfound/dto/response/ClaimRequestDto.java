@@ -15,6 +15,7 @@ public record ClaimRequestDto(
         String claimerLoginId,
         ClaimStatus status,
         String message,
+        String imageUrl,
         LocalDateTime createdAt
 ) {
     public static ClaimRequestDto from(ClaimRequest claimRequest) {
@@ -26,6 +27,7 @@ public record ClaimRequestDto(
                 .claimerLoginId(claimRequest.getClaimer().getLoginId())
                 .status(claimRequest.getStatus())
                 .message(claimRequest.getMessage())
+                .imageUrl(claimRequest.getImageUrl())
                 .createdAt(claimRequest.getCreatedAt())
                 .build();
     }

@@ -51,6 +51,7 @@ public class LostItemService {
     private final UserRepository userRepository;
     private final LostItemRepository lostItemRepository;
     private final TmapApiService tmapApiService;
+    private final WatchKeywordService watchKeywordService;
 
     /**
      * 분실물 등록
@@ -108,6 +109,14 @@ public class LostItemService {
         } catch (Exception e) {
             log.error("Failed to create embedding for item {}", lostItem.getId(), e);
             // 임베딩 생성 실패해도 분실물 등록은 성공으로 처리
+        }
+
+        // 4. 키워드 매칭 및 알림 발송 (비동기로 처리 가능)
+        try {
+            watchKeywordService.checkAndNotifyMatchingKeywords(lostItem);
+        } catch (Exception e) {
+            log.error("Failed to check watch keywords for item {}", lostItem.getId(), e);
+            // 키워드 체크 실패해도 분실물 등록은 성공으로 처리
         }
 
         return LostItemDto.from(lostItem);

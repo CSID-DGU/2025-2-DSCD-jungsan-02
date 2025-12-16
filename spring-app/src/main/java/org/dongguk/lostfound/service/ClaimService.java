@@ -1,5 +1,7 @@
 package org.dongguk.lostfound.service;
 
+import com.google.cloud.storage.BlobInfo;
+import com.google.cloud.storage.Storage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dongguk.lostfound.core.exception.CustomException;
@@ -14,16 +16,23 @@ import org.dongguk.lostfound.dto.response.ClaimRequestDto;
 import org.dongguk.lostfound.repository.ClaimRequestRepository;
 import org.dongguk.lostfound.repository.LostItemRepository;
 import org.dongguk.lostfound.repository.UserRepository;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
 import java.util.List;
+import java.util.UUID;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 @Transactional(readOnly = true)
 public class ClaimService {
+    @Value("${cloud.storage.bucket}")
+    private String BUCKET_NAME;
+    private final Storage storage;
     private final ClaimRequestRepository claimRequestRepository;
     private final LostItemRepository lostItemRepository;
     private final UserRepository userRepository;
@@ -33,7 +42,7 @@ public class ClaimService {
      * 회수 요청 생성
      */
     @Transactional
-    public ClaimRequestDto createClaimRequest(Long userId, Long lostItemId, CreateClaimRequest request) {
+    public ClaimRequestDto createClaimRequest(Long userId, Long lostItemId, CreateClaimRequest request, MultipartFile image) {
         User claimer = userRepository.findById(userId)
                 .orElseThrow(() -> CustomException.type(GlobalErrorCode.NOT_FOUND));
         
@@ -51,8 +60,19 @@ public class ClaimService {
                     throw CustomException.type(GlobalErrorCode.ALREADY_EXISTS);
                 });
         
+        // 이미지 업로드 (있는 경우)
+        String imageUrl = null;
+        if (image != null && !image.isEmpty()) {
+            try {
+                imageUrl = uploadImage(lostItemId, userId, image.getBytes(), image.getOriginalFilename());
+            } catch (IOException e) {
+                log.error("Failed to upload claim image", e);
+                throw new RuntimeException("이미지 업로드 실패");
+            }
+        }
+        
         // 회수 요청 생성
-        ClaimRequest claimRequest = ClaimRequest.create(lostItem, claimer, request.message());
+        ClaimRequest claimRequest = ClaimRequest.create(lostItem, claimer, request.message(), imageUrl);
         claimRequest = claimRequestRepository.save(claimRequest);
         
         // 상태는 변경하지 않음 (승인 시에만 MATCHED로 변경)
@@ -173,6 +193,36 @@ public class ClaimService {
         return claimRequests.stream()
                 .map(ClaimRequestDto::from)
                 .toList();
+    }
+
+    /**
+     * 회수 요청 이미지 업로드
+     */
+    private String uploadImage(Long lostItemId, Long userId, byte[] image, String imageName) {
+        UUID uuid = UUID.randomUUID();
+        String objectName = "claims/" + lostItemId + "/" + userId + "/" + imageName + "_" + uuid;
+
+        BlobInfo blobInfo = BlobInfo.newBuilder(BUCKET_NAME, objectName)
+                .setContentType(probeContentType(imageName))
+                .build();
+        storage.create(blobInfo, image);
+
+        return String.format("https://storage.googleapis.com/%s/%s", BUCKET_NAME, objectName);
+    }
+
+    /**
+     * 이미지 Content-Type 추출
+     */
+    private String probeContentType(String name) {
+        String ext = name.substring(name.lastIndexOf('.') + 1).toLowerCase();
+        return switch (ext) {
+            case "png" -> "image/png";
+            case "jpg", "jpeg" -> "image/jpeg";
+            case "gif" -> "image/gif";
+            case "bmp" -> "image/bmp";
+            case "webp" -> "image/webp";
+            default -> "application/octet-stream";
+        };
     }
 }
 

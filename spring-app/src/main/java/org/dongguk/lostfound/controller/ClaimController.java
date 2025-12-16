@@ -5,8 +5,10 @@ import org.dongguk.lostfound.core.annotation.UserId;
 import org.dongguk.lostfound.dto.request.CreateClaimRequest;
 import org.dongguk.lostfound.dto.response.ClaimRequestDto;
 import org.dongguk.lostfound.service.ClaimService;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 
@@ -19,13 +21,15 @@ public class ClaimController {
     /**
      * 회수 요청 생성
      */
-    @PostMapping("/lost-items/{lostItemId}")
+    @PostMapping(value = "/lost-items/{lostItemId}", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<ClaimRequestDto> createClaimRequest(
             @UserId Long userId,
             @PathVariable Long lostItemId,
-            @RequestBody CreateClaimRequest request
+            @RequestParam String message,
+            @RequestParam(required = false) MultipartFile image
     ) {
-        ClaimRequestDto result = claimService.createClaimRequest(userId, lostItemId, request);
+        CreateClaimRequest request = new CreateClaimRequest(message);
+        ClaimRequestDto result = claimService.createClaimRequest(userId, lostItemId, request, image);
         return ResponseEntity.ok(result);
     }
 

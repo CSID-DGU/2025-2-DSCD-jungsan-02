@@ -39,6 +39,9 @@ public class ClaimRequest {
     @Column(name = "message", length = 1000)
     private String message;  // 회수 요청 메시지
 
+    @Column(name = "image_url", length = 500)
+    private String imageUrl;  // 회수 요청 증빙 이미지 URL
+
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
 
@@ -50,22 +53,25 @@ public class ClaimRequest {
                         User claimer,
                         ClaimStatus status,
                         String message,
+                        String imageUrl,
                         LocalDateTime createdAt,
                         LocalDateTime updatedAt) {
         this.lostItem = lostItem;
         this.claimer = claimer;
         this.status = status;
         this.message = message;
+        this.imageUrl = imageUrl;
         this.createdAt = createdAt;
         this.updatedAt = updatedAt;
     }
 
-    public static ClaimRequest create(LostItem lostItem, User claimer, String message) {
+    public static ClaimRequest create(LostItem lostItem, User claimer, String message, String imageUrl) {
         return ClaimRequest.builder()
                 .lostItem(lostItem)
                 .claimer(claimer)
                 .status(ClaimStatus.PENDING)
                 .message(message)
+                .imageUrl(imageUrl)
                 .createdAt(LocalDateTime.now())
                 .build();
     }
