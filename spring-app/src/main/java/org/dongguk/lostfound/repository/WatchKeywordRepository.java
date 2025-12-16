@@ -20,3 +20,4 @@ public interface WatchKeywordRepository extends JpaRepository<WatchKeyword, Long
     Optional<WatchKeyword> findByUserIdAndKeyword(Long userId, String keyword);
 }
 
+

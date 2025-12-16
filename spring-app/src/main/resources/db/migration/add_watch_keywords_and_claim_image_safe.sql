@@ -40,3 +40,4 @@ DEALLOCATE PREPARE alterIfNotExists;
 -- 마이그레이션 완료
 -- ============================================
 
+

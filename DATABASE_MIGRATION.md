@@ -98,3 +98,4 @@ SHOW COLUMNS FROM claim_requests LIKE 'image_url';
 2. **기존 데이터**: `claim_requests` 테이블의 기존 데이터는 그대로 유지됩니다.
 3. **외래 키**: `watch_keywords.user_id`는 `users.id`를 참조합니다.
 
+
